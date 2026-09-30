@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>작업방 · 로그인</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="작업방">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1c1c1e" media="(prefers-color-scheme: dark)">
+<style>
+  :root { --bg: #ffffff; --text: #1d1d1f; --sub: #86868b; --field: #f2f2f7; --line: #e5e5ea; --sel: #0a84ff; --danger: #ff3b30; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1c1c1e; --text: #f5f5f7; --sub: #98989d; --field: #2c2c2e; --line: #38383a; } }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: max(24px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom)); }
+  .box { width: 100%; max-width: 360px; text-align: center; }
+  img { width: 76px; height: 76px; border-radius: 18px; }
+  h1 { font-size: 22px; margin: 14px 0 4px; letter-spacing: -0.02em; }
+  p { color: var(--sub); font-size: 14px; line-height: 1.55; margin: 0 0 20px; }
+  input { width: 100%; font-size: 17px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--field); color: var(--text); outline: none; }
+  input:focus { border-color: var(--sel); }
+  button { width: 100%; margin-top: 12px; font-size: 17px; font-weight: 600; padding: 13px; border: 0; border-radius: 12px; background: var(--sel); color: #fff; }
+  button:disabled { opacity: 0.5; }
+  .err { color: var(--danger); font-size: 14px; min-height: 20px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<form class="box" id="f" autocomplete="on">
+  <img src="/static/icons/icon-192.png" alt="">
+  <h1>작업방</h1>
+  <p id="msg">비밀번호를 입력해 주세요.</p>
+  <input type="text" name="username" value="작업방" autocomplete="username" hidden>
+  <input type="password" id="pw" autocomplete="current-password" placeholder="비밀번호" required>
+  <button id="go">로그인</button>
+  <div class="err" id="err"></div>
+</form>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+if ("serviceWorker" in navigator && window.isSecureContext) navigator.serviceWorker.register("/sw.js").catch(() => {});
+fetch("/api/auth/status").then((r) => r.json()).then((s) => {
+  if (s.logged_in) { location.replace("/"); return; }      // 이미 로그인된 기기는 바로 들어감
+  if (!s.password_set) { $("msg").textContent = "아직 비밀번호가 없습니다. PC 화면의 설정 → 모바일·알림에서 먼저 정해 주세요."; $("go").disabled = true; }
+}).catch(() => {});
+$("f").onsubmit = async (e) => {
+  e.preventDefault();
+  $("go").disabled = true; $("err").textContent = "";
+  try {
+    const r = await fetch("/api/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: $("pw").value }) });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) { location.replace("/"); return; }
+    $("err").textContent = d.detail || `로그인 실패 (${r.status})`;
+  } catch { $("err").textContent = "PC 에 연결할 수 없습니다. PC·작업방·Tailscale 이 켜져 있는지 확인해 주세요."; }
+  $("go").disabled = false; $("pw").select();
+};
+</script>
+</body>
+</html>

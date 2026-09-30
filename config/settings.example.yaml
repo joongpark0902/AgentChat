@@ -1,0 +1,30 @@
+# 배포용 예시입니다. 처음 실행하면 settings.yaml 로 복사됩니다(개인 설정, git 제외).
+# python_dir 을 비워 두면 서버를 실행한 python 의 폴더를 씁니다.
+host: 127.0.0.1
+port: 8780
+max_rounds: 3
+call_timeout_sec: 1800
+workspace_root: workspace
+log_dir: logs
+python_dir: ''
+claude:
+  exe: claude
+  safe_mode: false
+codex:
+  exe: auto
+  sandbox: workspace-write
+  windows_sandbox: unelevated
+stt:
+  engine: local
+  model: small
+  vocabulary:
+  - 손익
+  - 영업이익
+  - 매출
+  - 원가
+  - 판관비
+  - 재무제표
+  - 감사조서
+  - 주석
+  - 엑셀
+  - 풋팅

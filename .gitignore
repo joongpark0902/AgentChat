@@ -1,0 +1,13 @@
+workspace/
+logs/
+__pycache__/
+*.pyc
+backups/
+models/
+private/
+config/backups/
+*.lnk
+/index.html
+.claude/
+config/agents.yaml
+config/settings.yaml

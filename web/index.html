@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="작업방">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1c1c1e" media="(prefers-color-scheme: dark)">
+<title>작업방</title>
+<script>try{var th=JSON.parse(localStorage.getItem("theme")||"\"auto\"");if(th!=="auto")document.documentElement.dataset.theme=th;}catch(e){}</script>
+<link rel="preconnect" href="https://cdn.jsdelivr.net">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css">
+<link rel="stylesheet" href="/static/style.css?v=19">
+</head>
+<body>
+<div class="app" id="app">
+  <!-- ───────── 대화 목록 ───────── -->
+  <aside class="sidebar" id="sidebar">
+    <div class="side-top">
+      <div class="side-title">대화</div>
+      <button class="icon-btn" id="btnCompose" title="새 대화">
+        <svg viewBox="0 0 24 24"><path d="M4 20h4l10.5-10.5a2.1 2.1 0 0 0-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/></svg>
+      </button>
+    </div>
+    <div class="search-wrap">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4.2-4.2"/></svg>
+      <input id="search" class="search" placeholder="검색" autocomplete="off">
+    </div>
+    <div class="conv-list" id="convList"></div>
+    <div class="side-foot">
+      <div class="usage-box" id="usageBox" title="구독 한도 사용률 · 눌러서 자세히"></div>
+      <div class="foot-row">
+      <button class="side-link" id="btnSettingsSide">
+        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+        설정
+      </button>
+      <button class="theme-btn" id="btnTheme" title="화면 모드"></button>
+      <span class="conn" id="conn" title="서버 연결 상태"></span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ───────── 대화창 ───────── -->
+  <section class="main" id="main">
+    <header class="chat-head">
+      <button class="icon-btn only-narrow" id="btnBack" title="대화 목록">
+        <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+      </button>
+      <div class="head-center">
+        <div class="members" id="members"></div>
+        <div class="chat-title" id="chatTitle">작업방</div>
+        <div class="chat-sub" id="chatSub"></div>
+      </div>
+      <div class="head-actions">
+        <button class="pill danger" id="btnStop" hidden>중단</button>
+        <button class="icon-btn" id="btnLeave" title="대화 나가기" hidden>
+          <svg viewBox="0 0 24 24"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 16l-4-4 4-4M6 12h10"/></svg>
+        </button>
+        <button class="icon-btn" id="btnFiles" title="파일">
+          <svg viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+        </button>
+        <button class="icon-btn" id="btnSettings" title="설정">
+          <svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="body">
+      <div class="thread-col">
+        <main class="thread" id="thread">
+          <div id="empty" class="empty"></div>
+          <div id="messages"></div>
+          <div id="typing"></div>
+        </main>
+        <div class="status" id="status"></div>
+        <footer class="composer" id="composer">
+          <div class="hold-bar hidden" id="holdBar"></div>
+          <div class="chips" id="chips"></div>
+          <div class="composer-row">
+            <button class="round-btn" id="btnAttach" title="파일 첨부">
+              <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+            <input type="file" id="fileInput" multiple hidden>
+            <button class="round-btn mic" id="btnMic" title="음성 입력">
+              <svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
+            </button>
+            <div class="field">
+              <button class="mode-chip" id="modeBtn" title="대화 방식"></button>
+              <textarea id="input" rows="1" placeholder="메시지 입력  ·  @이름으로 한 사람만 부르기"></textarea>
+              <button class="send" id="btnSend" aria-label="보내기" disabled>
+                <svg viewBox="0 0 24 24"><path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/></svg>
+              </button>
+            </div>
+          </div>
+          <div class="popover hidden" id="modeMenu"></div>
+          <div class="popover hidden" id="mentionPop"></div>
+        </footer>
+      </div>
+
+      <aside class="files-panel hidden" id="filesPanel">
+        <div class="fp-head">
+          <div class="fp-title">파일</div>
+          <button class="icon-btn sm" id="fpRefresh" title="새로고침"><svg viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 5v6h-6"/></svg></button>
+          <button class="icon-btn sm" id="fpOpen" title="탐색기에서 열기"><svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/></svg></button>
+          <button class="icon-btn sm" id="fpClose" title="닫기"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+        </div>
+        <div class="fp-path" id="fpPath"></div>
+        <div class="fp-tabs" id="fpTabs"></div>
+        <div class="fp-list" id="fpList"></div>
+        <div class="fp-preview hidden" id="fpPreview"></div>
+      </aside>
+    </div>
+  </section>
+  <div class="drawer-back" id="drawerBack"></div>
+</div>
+
+<div class="modal-root" id="modalRoot"></div>
+<div class="toast" id="toast"></div>
+<div class="drop-overlay hidden" id="dropOverlay"><div>여기에 놓으면 첨부됩니다</div></div>
+<script src="/static/app.js?v=19"></script>
+</body>
+</html>
