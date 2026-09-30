@@ -12,6 +12,22 @@ API 키는 쓰지 않고 **이미 로그인된 공식 CLI만** subprocess로 부
 
 프로필 사진은 Codex 내장 이미지 생성(ChatGPT 구독)으로 만든 **가상 인물** 사진입니다.
 
+## 화면
+
+아래 사진은 지어낸 예시 자료(샘플 매출)로 찍은 것입니다.
+
+**대화와 파일 패널** — 지시 → Jake 작업 → Clara 가 결과물 파일을 열어 지시 항목별로 확인
+![대화 화면](docs/screenshot-1-chat.jpg)
+
+**검증과 수정** — Eric 이 원자료에서 다시 계산해 합계 오류를 잡고, Jake 가 새 버전으로 고침
+![검토 라운드](docs/screenshot-2-review.jpg)
+
+**컨텍스트** — 담당자별 세션이 들고 있는 대화 분량과 압축 버튼
+![컨텍스트 창](docs/screenshot-3-context.jpg)
+
+**보낸 뒤 고치기** — 보내고 몇 초 안에 Esc 를 누르면 입력창으로 되돌아옴. 파일 패널의 파일은 끌어다 첨부
+![보내기 전 대기](docs/screenshot-4-hold.jpg)
+
 ## 처음 설치 (Windows 전용)
 
 1. 준비물: Windows 10/11, [Python 3.10+](https://www.python.org/downloads/), 로그인된 [Claude Code](https://claude.com/claude-code)(`claude auth status`), 선택으로 Codex(ChatGPT 로그인, `codex login status`)
