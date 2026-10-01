@@ -9,27 +9,49 @@ def _numbered(items: list[str]) -> str:
     return "\n".join(f"{i}. {t}" for i, t in enumerate(items, 1))
 
 
+# 10/1: 사용자 요청 — 한 번에 긴 작업 대신 같은 시간을 3라운드로 나눠 셋이 자주 주고받으며 산출물을 낸다
+STAGED_PLAN_WORKER = (
+    "[라운드 1 — 방향 잡기] 이 과제는 감독과 주고받으며 3라운드로 진행합니다(1 방향 → 2 초안 → 3 마무리).\n"
+    "이번 라운드에서는 본 작업(산출물 작성·계산)을 하지 말고, 몇 분 안에 끝낼 분량으로 아래만 짧게 올려 주세요.\n"
+    "① 지시를 어떻게 이해했는지 ② 산출물 구성(파일명, 시트·목차) ③ 쓸 원자료와 위치 ④ 작업 순서 ⑤ {user}이 정해야 할 것\n"
+    "원자료는 구성을 파악할 만큼만 열어 보세요.")
+
+STAGED_DRAFT_WORKER = ("[라운드 2 — 초안] 감독들이 계획을 검토했습니다. 지적마다 반영 여부를 한 줄씩 답하고, "
+                       "계획대로 본 작업을 해 산출물 초안을 만든 뒤 보고해 주세요. 라운드 3에서 감독 지적을 받아 마무리합니다.")
+
+STAGED_PLAN_REVIEW = (
+    "[라운드 1 — 계획 검토] {worker}가 본 작업 전에 계획만 올렸습니다(산출물은 아직 없음). "
+    "당신의 체크리스트 관점에서 미리 짚을 점만 짧게 지적하세요: 지시 누락·오해석, 산출물 구성, 원자료 선택, 빠진 검증. "
+    "재계산·파일 전수 검토는 라운드 2(초안)에서 합니다. 필요하면 원자료 위치·구성만 확인하세요. "
+    "계획대로 가도 되면 APPROVE 입니다(승인해도 라운드 2 초안으로 넘어갑니다).")
+
+
 def worker_prompt(round_no: int, requirements: list[str], new_requirements: list[str],
-                  feedback: list[tuple[AgentConfig, Review]], user_name: str) -> str:
-    if round_no == 1 and not feedback:
+                  feedback: list[tuple[AgentConfig, Review]], user_name: str, stage: str | None = None) -> str:
+    if stage == "plan":
+        parts = [f"[{user_name}의 지시]\n{_numbered(requirements)}", STAGED_PLAN_WORKER.format(user=user_name)]
+    elif round_no == 1 and not feedback:
         parts = [f"[{user_name}의 지시]\n{_numbered(requirements)}", "작업하고 결과를 보고해 주세요."]
     else:
-        parts = [f"[라운드 {round_no}] 감독 검토 결과입니다. 지적마다 수정 여부를 답하고 필요한 수정을 해 주세요."]
+        head = STAGED_DRAFT_WORKER if stage == "draft" else \
+            f"[라운드 {round_no}] 감독 검토 결과입니다. 지적마다 수정 여부를 답하고 필요한 수정을 해 주세요."
+        parts = [head]
         for agent, review in feedback:
             parts.append(f"■ {agent.name}({agent.title}) — {review.verdict}\n{review.to_text()}")
         if any(r.user_blockers for _, r in feedback):
             parts.append(f"('사용자 결정' 표시가 붙은 지적은 {user_name}이 정할 사안입니다. 임의로 고치지 말고 그대로 두세요. "
                          f"과제가 끝날 때 {user_name}께 따로 넘어갑니다.)")
-    if new_requirements and not (round_no == 1 and not feedback):
+    if new_requirements and stage != "plan" and not (round_no == 1 and not feedback):
         parts.append(f"[{user_name}이 새로 추가한 지시 — 최우선 반영]\n{_numbered(new_requirements)}")
     return "\n\n".join(parts)
 
 
 def review_prompt(round_no: int, requirements: list[str], new_requirements: list[str],
                   worker: AgentConfig, worker_report: str, workspace: str, user_name: str,
-                  worker_unseen: list[str] | None = None, changed_files: list[str] | None = None) -> str:
+                  worker_unseen: list[str] | None = None, changed_files: list[str] | None = None,
+                  stage: str | None = None) -> str:
     parts = [
-        f"[라운드 {round_no} 검토 요청]",
+        STAGED_PLAN_REVIEW.format(worker=worker.name) if stage == "plan" else f"[라운드 {round_no} 검토 요청]",
         f"[{user_name}의 지시 전체]\n{_numbered(requirements)}",
     ]
     if new_requirements:
@@ -46,12 +68,17 @@ def review_prompt(round_no: int, requirements: list[str], new_requirements: list
                          "검토는 이 파일들과 그 근거가 된 원자료를 중심으로 하고, 폴더 전체를 다시 훑는 것은 꼭 필요할 때만 하세요.")
         else:
             parts.append("(이번 라운드에 작업 폴더에서 바뀐 파일이 없습니다. 보고 내용과 관련 파일만 확인하세요.)")
-    if round_no >= 2:
+    if stage == "draft":
+        parts.append("라운드 2(초안)입니다. 계획 단계에서 당신이 짚은 점이 반영됐는지와, 새로 만든 산출물을 체크리스트대로 검토하세요.")
+    elif round_no >= 2:
         # 9/30: 같은 검증을 라운드마다 처음부터 다시 해 감독 한 번에 최대 22분이 걸렸음
         parts.append("라운드 2 이상입니다. 직전 라운드에 당신이 지적한 것이 해결됐는지와 이번에 바뀐 파일만 확인하세요. "
                      "이미 확인해 통과시킨 항목은 다시 검증하지 않습니다.")
     parts.append(NEEDS_USER_RULE.format(worker=worker.name, user=user_name))
-    parts.append(f"작업 폴더 {workspace} 의 파일을 직접 확인하고, 당신의 체크리스트 범위만 검토해 JSON 으로 답해 주세요.")
+    if stage == "plan":
+        parts.append(f"작업 폴더는 {workspace} 입니다. 당신의 체크리스트 범위만, 짧게 JSON 으로 답해 주세요.")
+    else:
+        parts.append(f"작업 폴더 {workspace} 의 파일을 직접 확인하고, 당신의 체크리스트 범위만 검토해 JSON 으로 답해 주세요.")
     return "\n\n".join(parts)
 
 

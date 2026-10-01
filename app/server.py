@@ -404,10 +404,11 @@ def create_app(manager_factory=None, transcriber=None, private_dir: Path | None 
 
     @app.post("/api/conversations")
     async def create_conversation(body: dict = Body(default={})):
-        gr = body.get("global_rules")
+        gr = body.get("global_rules")  # True/False(전원 일괄) 또는 {담당자: True/False}
         try:
             room = mgr().create(workspace=body.get("workspace") or None, title=body.get("title") or None,
-                                safe_mode=None if gr is None else not bool(gr),
+                                safe_mode=None if gr is None or isinstance(gr, dict) else not bool(gr),
+                                global_rules=gr if isinstance(gr, dict) else None,
                                 exclude=[str(x) for x in body.get("exclude") or []])
         except ValueError as e:
             raise HTTPException(400, str(e))
@@ -539,6 +540,10 @@ def create_app(manager_factory=None, transcriber=None, private_dir: Path | None 
                     mode = msg.get("mode") if msg.get("mode") in ("review", "quick") else "review"
                     await room.user_message(str(msg.get("text", "")), mode=mode,
                                             attachments=[str(a) for a in msg.get("attachments") or []])
+                elif kind == "edit" and room:
+                    ok = await room.edit_message(str(msg.get("id", "")))
+                    await ws.send_text(json.dumps({"type": "edit_result", "conv": room.conv_id,
+                                                   "id": msg.get("id"), "ok": ok}, ensure_ascii=False))
                 elif kind == "stop" and room:
                     asyncio.create_task(room.stop())
                 elif kind == "approve" and room:

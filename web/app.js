@@ -31,7 +31,8 @@ const S = {
   prevRunning: {},          // 다른 대화가 끝났을 때 화면 안에서 알리려고
   contexts: {},             // 담당자별 세션 컨텍스트 {used, window, updated}
   hold: null,               // 보내기 직전 잠깐 붙잡아 둔 메시지 {conv, text, mode, files, atts, timer, left}
-  sendDelay: store.get("sendDelay", 4),  // 보내기 전 Esc 로 되돌릴 수 있는 시간(초). 0 = 바로 보냄
+  editable: [],             // 지금 수정할 수 있는 내 메시지 id(전달 대기 중이거나, 첫 답이 나오기 전)
+  sendDelay: store.get("sendDelay", 10),  // 보내기 전 Esc 로 되돌릴 수 있는 시간(초). 0 = 바로 보냄
 };
 
 const narrow = () => window.matchMedia("(max-width: 860px)").matches;
@@ -249,7 +250,10 @@ function renderHeader() {
       chip.onclick = openContextModal;
       sub.appendChild(chip);
     }
-    if (s.safe_mode) sub.appendChild(el("span", "tag warn", "전역 규칙 OFF"));
+    const off = s.rules_off || [];
+    const claudeKeys = order().filter((k) => agent(k).engine === "claude");
+    if (off.length && claudeKeys.length && claudeKeys.every((k) => off.includes(k))) sub.appendChild(el("span", "tag warn", "전역 규칙 OFF"));
+    else off.forEach((k) => sub.appendChild(el("span", "tag warn", `${esc(agent(k).name)} 규칙 OFF`)));
     (s.excluded || []).forEach((k) => sub.appendChild(el("span", "tag warn", `${esc(agent(k).name)} 제외`)));
   }
   $("btnStop").hidden = !S.running;
@@ -264,6 +268,10 @@ const GROUP_GAP = 600;
 function sameGroup(a, b) {
   return a && b && a.sender === b.sender && b.sender !== "system" && a.kind !== "approval" && b.kind !== "approval" && b.ts - a.ts < GROUP_GAP;
 }
+
+const STAGE_NAMES = { plan: "방향", draft: "초안" };
+function roundLabel(msg) { return `라운드 ${msg.round}` + (STAGE_NAMES[msg.stage] ? ` · ${STAGE_NAMES[msg.stage]}` : ""); }
+function totalRounds() { return S.config.flow === "staged" ? Math.max(2, S.config.max_rounds) : S.config.max_rounds; }
 
 function renderMessage(msg, prev) {
   const frag = document.createDocumentFragment();
@@ -294,12 +302,19 @@ function renderMessage(msg, prev) {
     const a = agent(msg.sender);
     col.appendChild(el("div", "sender", `<b>${esc(a.name)}</b><span>${esc(a.title)}</span>` +
       (msg.verdict ? `<span class="badge ${esc(msg.verdict)}">${msg.verdict === "APPROVE" ? "승인" : "수정 요청"}</span>` : "") +
-      (msg.round ? `<span class="round">라운드 ${msg.round}</span>` : "")));
+      (msg.round ? `<span class="round">${roundLabel(msg)}</span>` : "")));
   } else if (!isUser && msg.verdict) {
     col.appendChild(el("div", "sender", `<span class="badge ${esc(msg.verdict)}">${msg.verdict === "APPROVE" ? "승인" : "수정 요청"}</span>` +
-      (msg.round ? `<span class="round">라운드 ${msg.round}</span>` : "")));
+      (msg.round ? `<span class="round">${roundLabel(msg)}</span>` : "")));
   }
   col.appendChild(msg.kind === "approval" ? approvalCard(msg) : bubble(msg));
+  if (isUser && msg.retracted) { row.classList.add("retracted"); col.appendChild(el("div", "meta-tokens", "수정됨 · 이 지시는 취소했습니다")); }
+  else if (isUser && S.editable.includes(msg.id)) {
+    const ed = el("button", "msg-edit", "수정");
+    ed.title = "진행을 멈추고 이 지시를 입력창으로 되돌려 고칩니다 (담당자의 첫 답이 나오기 전까지)";
+    ed.onclick = () => { ed.disabled = true; send({ type: "edit", conv: S.conv, id: msg.id }); };
+    col.appendChild(ed);
+  }
   if (msg.usage && !isUser) col.appendChild(tokenMeta(msg.usage));
   if (msg.changed_files?.length) {
     const cf = el("div", "meta-tokens changed", `바뀐 파일 ${msg.changed_files.length}개 · 파일 패널에서 보기`);
@@ -401,6 +416,24 @@ function appendMessage(msg) {
   if (S.filesOpen && msg.sender !== "user") loadFiles();
 }
 
+// 수정 가능한 메시지 목록이 바뀌면 그 말풍선들만 다시 그린다("수정" 버튼을 붙이고 떼기)
+function setEditable(ids, force) {
+  const changed = new Set([...S.editable.filter((x) => !ids.includes(x)), ...ids.filter((x) => !S.editable.includes(x))]);
+  S.editable = ids;
+  S.messages.forEach((m) => { if (changed.has(m.id) || (force && m.sender === "user")) updateMessage(m); });
+}
+
+function restoreToInput(msg) {
+  if (!msg) return;
+  const t = $("input");
+  t.value = msg.text + (t.value ? "\n" + t.value : "");
+  const have = new Set(S.attachments.map((a) => a.path));
+  (msg.attachments || []).forEach((p) => { if (!have.has(p)) S.attachments.push({ name: p.split("/").pop(), path: p }); });
+  renderChips(); autosize();
+  t.focus();
+  t.setSelectionRange(t.value.length, t.value.length);
+}
+
 function updateMessage(msg) {
   const i = S.messages.findIndex((m) => m.id === msg.id);
   if (i < 0) return;
@@ -474,7 +507,7 @@ function renderTyping() {
 
 function renderStatus() {
   const p = [];
-  if (S.running && S.round) p.push(`검토 진행 중 · 라운드 ${S.round}/${S.config.max_rounds}`);
+  if (S.running && S.round) p.push(`검토 진행 중 · 라운드 ${S.round}/${totalRounds()}` + (S.config.flow === "staged" ? ` (${["", "방향", "초안", "마무리"][S.round] || "추가"})` : ""));
   else if (S.running) p.push("답변 중");
   if (S.pending) p.push(`전달 대기 지시 ${S.pending}건`);
   const waiting = S.messages.filter((m) => m.kind === "approval" && m.approval?.status === "pending").length;
@@ -519,6 +552,7 @@ function connect() {
         if (!mine) break;
         S.messages = d.messages; S.typing = d.typing || {}; S.typingTokens = d.typing_tokens || {}; S.running = d.running; S.round = d.round; S.pending = d.pending; S.summary = d.summary;
         S.contexts = d.contexts || {};
+        S.editable = d.editable || [];
         renderAll();
         if (S.filesOpen) loadFiles();
         break;
@@ -539,7 +573,13 @@ function connect() {
       case "state":
         if (!mine) break;
         S.running = d.running; S.round = d.round; S.pending = d.pending;
+        setEditable(d.editable || []);
         renderStatus(); renderHeader();
+        break;
+      case "edit_result":
+        if (!mine) break;
+        if (d.ok) restoreToInput(S.messages.find((m) => m.id === d.id));
+        else { toast("이미 답이 나와서 수정할 수 없습니다. 추가 지시로 보내 주세요."); setEditable(S.editable.filter((x) => x !== d.id), true); }
         break;
       case "conversations":
         S.conversations = d.conversations;
@@ -573,7 +613,7 @@ function openConv(id, silent) {
   flushHold();  // 붙잡아 둔 메시지는 원래 대화로 보내고 넘어간다
   S.conv = id;
   store.set("conv", id);
-  S.messages = []; S.typing = {}; S.running = false; S.round = 0; S.pending = 0; S.contexts = {};
+  S.messages = []; S.typing = {}; S.running = false; S.round = 0; S.pending = 0; S.contexts = {}; S.editable = [];
   S.summary = S.conversations.find((c) => c.id === id) || null;
   S.attachments = []; renderChips();
   S.previewPath = null;
@@ -596,7 +636,7 @@ function toggleModeMenu(show) {
   if (show === false || !m.classList.contains("hidden")) { m.classList.add("hidden"); return; }
   const w = agent(S.config.worker).name, rv = S.config.reviewers.map((k) => agent(k).name).join("·");
   m.innerHTML = "";
-  [["review", "검토 모드", `${w}가 작업 → ${rv}가 검토 (최대 ${S.config.max_rounds}라운드)`],
+  [["review", "검토 모드", S.config.flow === "staged" ? `${totalRounds()}라운드로 주고받기: 1 방향 → 2 초안 → 3 마무리 (${w} 작업 · ${rv} 검토)` : `${w}가 작업 → ${rv}가 검토 (최대 ${S.config.max_rounds}라운드)`],
    ["quick", "빠른 질문", `${w}만 바로 답변, 검토 없음`]].forEach(([k, t, s]) => {
     const it = el("div", "menu-item", `<span class="check">${S.mode === k ? "✓" : ""}</span><div><div class="mi-title">${t}</div><div class="mi-sub">${esc(s)}</div></div>`);
     it.onclick = () => { S.mode = k; store.set("mode", k); renderMode(); m.classList.add("hidden"); $("input").focus(); };
@@ -724,7 +764,7 @@ function renderHold() {
   box.appendChild(el("span", "hold-left", `${h.left}초 뒤 전송`));
   const edit = el("button", "hold-btn", "수정 <kbd>Esc</kbd>");
   edit.onclick = cancelHold;
-  const now = el("button", "hold-btn primary", "바로 보내기");
+  const now = el("button", "hold-btn primary", "바로 보내기 <kbd>Enter</kbd>");
   now.onclick = flushHold;
   box.append(edit, now);
 }
@@ -1369,11 +1409,23 @@ function openNewConvModal() {
   bOld.onclick = () => { kind = "old"; bOld.classList.add("on"); bNew.classList.remove("on"); pickRow.classList.remove("hidden"); };
 
   const g3 = el("div", "form-group");
-  const sw = switchEl(true);
-  api("GET", "/api/config").then((d) => { sw.input.checked = d.editable.settings.global_rules; }).catch(() => {});
-  const r3 = el("div", "form-row", `<label>전역 규칙 적용</label><div class="hint" style="flex:1">${esc(userName())}의 전역 규칙(CLAUDE.md·AGENTS.md)·플러그인을 Claude 에이전트에 싣습니다. 끄면 역할 지침만 쓰고 더 빠르고 가볍습니다. 대화마다 고정됩니다.</div>`);
-  r3.appendChild(sw);
-  g3.appendChild(r3);
+  g3.appendChild(el("div", "form-row", `<div class="hint" style="flex:1"><b>전역 규칙 적용</b> — ${esc(userName())}의 전역 규칙(CLAUDE.md·AGENTS.md)·플러그인을 담당자별로 싣습니다. 끄면 역할 지침만 쓰고 더 빠르고 가볍습니다. 대화마다 고정됩니다.</div>`));
+  const ruleSw = {};
+  order().forEach((k) => {
+    const a = agent(k);
+    if (a.engine === "claude") {
+      const sw = ruleSw[k] = switchEl(true);
+      const r = el("div", "form-row", `<label>${esc(a.name)}</label><div class="hint" style="flex:1">${esc(a.title)}</div>`);
+      r.appendChild(sw);
+      g3.appendChild(r);
+    } else {
+      g3.appendChild(el("div", "form-row", `<label>${esc(a.name)}</label><div class="hint" style="flex:1">Codex 는 이 스위치와 무관하게 AGENTS.md 를 항상 읽습니다.</div>`));
+    }
+  });
+  api("GET", "/api/config").then((d) => {
+    const ga = d.editable.settings.global_rules_agents || {};
+    Object.entries(ruleSw).forEach(([k, sw]) => { sw.input.checked = ga[k] ?? d.editable.settings.global_rules; });
+  }).catch(() => {});
   pane.appendChild(g3);
 
   const codexKeys = (S.config.reviewers || []).filter((k) => agent(k).engine === "codex");
@@ -1394,7 +1446,7 @@ function openNewConvModal() {
     if (kind === "old" && !path.value.trim()) { toast("작업할 폴더를 골라 주세요"); return; }
     ok.disabled = true;
     try {
-      const d = await api("POST", "/api/conversations", { title: title.value.trim() || null, workspace: kind === "old" ? path.value.trim() : null, global_rules: sw.input.checked, exclude: exSw?.input.checked ? codexKeys : [] });
+      const d = await api("POST", "/api/conversations", { title: title.value.trim() || null, workspace: kind === "old" ? path.value.trim() : null, global_rules: Object.fromEntries(Object.entries(ruleSw).map(([k, sw]) => [k, sw.input.checked])), exclude: exSw?.input.checked ? codexKeys : [] });
       S.conversations = [d.summary, ...S.conversations.filter((c) => c.id !== d.id)];
       if (kind === "old" && !S.recent.includes(path.value.trim())) S.recent.unshift(path.value.trim());
       closeModal();
@@ -1576,21 +1628,42 @@ function renderSettingsPane() {
 
     pane.appendChild(el("div", "group-title", "진행 방식"));
     const g2 = el("div", "form-group");
-    const sw = switchEl(data.settings.global_rules);
-    sw.input.onchange = () => (data.settings.global_rules = sw.input.checked);
-    const r = el("div", "form-row", `<label>전역 규칙 적용</label><div class="hint" style="flex:1">켜면 Claude 에이전트가 전역 규칙(CLAUDE.md·AGENTS.md)·플러그인·훅을 함께 읽습니다(호출당 약 69k 토큰). 끄면 역할 지침만 씁니다. <b>새 대화부터</b> 적용됩니다.</div>`);
-    r.appendChild(sw);
-    g2.appendChild(r);
+    const fl = el("select");
+    [["staged", "3단계로 주고받기 — 1 방향(계획) → 2 초안 → 3 마무리"], ["classic", "기존 방식 — 라운드마다 완성본을 내고 검토"]].forEach(([v, l]) => {
+      const o = el("option", "", l); o.value = v; if ((data.settings.flow || "classic") === v) o.selected = true; fl.appendChild(o);
+    });
+    fl.onchange = () => (data.settings.flow = fl.value);
+    g2.appendChild(formRow("진행 방식", fl, "3단계: 라운드 1에서 실무자는 계획만 올리고 감독이 짧게 짚은 뒤, 라운드 2에서 초안을 만듭니다. 초안이 승인되면 거기서 끝나고, 마지막 라운드까지 승인이 안 나면 쟁점을 정리해 넘깁니다. 다음 지시부터 적용됩니다."));
     const mr = input(data.settings.max_rounds, "number", { min: 1, max: 10 });
     mr.oninput = () => (data.settings.max_rounds = Number(mr.value));
-    g2.appendChild(formRow("최대 라운드", mr, "두 감독이 이 횟수 안에 승인하지 않으면 쟁점을 정리해 넘깁니다."));
+    g2.appendChild(formRow("최대 라운드", mr, "두 감독이 이 횟수 안에 승인하지 않으면 쟁점을 정리해 넘깁니다. 3단계 방식은 최소 2입니다."));
+    pane.appendChild(g2);
+
+    pane.appendChild(el("div", "group-title", "전역 규칙 적용 (담당자별)"));
+    const gr = el("div", "form-group");
+    gr.appendChild(el("div", "form-row", `<div class="hint" style="flex:1">켜면 그 담당자가 전역 규칙(CLAUDE.md·AGENTS.md)·플러그인·훅을 함께 읽습니다(호출당 약 69k 토큰). 끄면 역할 지침만 씁니다. <b>새 대화부터</b> 적용되고, 새 대화 창에서 대화마다 바꿀 수도 있습니다.</div>`));
+    data.settings.global_rules_agents = data.settings.global_rules_agents || {};
+    Object.entries(data.agents).forEach(([k, a]) => {
+      if (a.engine !== "claude") {
+        gr.appendChild(el("div", "form-row", `<label>${esc(a.name)}</label><div class="hint" style="flex:1">Codex 는 이 스위치와 무관하게 AGENTS.md 를 항상 읽습니다.</div>`));
+        return;
+      }
+      const sw = switchEl(data.settings.global_rules_agents[k] ?? data.settings.global_rules);
+      sw.input.onchange = () => (data.settings.global_rules_agents[k] = sw.input.checked);
+      const r = el("div", "form-row", `<label>${esc(a.name)}</label><div class="hint" style="flex:1">${esc(a.title || "")}</div>`);
+      r.appendChild(sw);
+      gr.appendChild(r);
+    });
+    pane.appendChild(gr);
+    pane.appendChild(el("div", "group-title", "시간"));
+    const g2b = el("div", "form-group");
     const to = input(Math.round(data.settings.call_timeout_sec / 60), "number", { min: 1, max: 180 });
     to.oninput = () => (data.settings.call_timeout_sec = Number(to.value) * 60);
-    g2.appendChild(formRow("호출 제한 시간(분)", to, "에이전트 한 번의 답변이 이 시간을 넘기면 중단합니다."));
+    g2b.appendChild(formRow("호출 제한 시간(분)", to, "에이전트 한 번의 답변이 이 시간을 넘기면 중단합니다."));
     const sd = input(S.sendDelay, "number", { min: 0, max: 30 });
     sd.oninput = () => { S.sendDelay = Math.max(0, Math.min(30, Number(sd.value) || 0)); store.set("sendDelay", S.sendDelay); };
-    g2.appendChild(formRow("보내기 전 대기(초)", sd, "보낸 뒤 이 시간 안에 Esc 를 누르면 입력창으로 되돌려 고칠 수 있습니다. 0이면 바로 보냅니다. 이 기기에만 저장되고 바로 적용됩니다."));
-    pane.appendChild(g2);
+    g2b.appendChild(formRow("보내기 전 대기(초)", sd, "보낸 뒤 이 시간 안에 Esc 를 누르면 입력창으로 되돌려 고칠 수 있습니다. 0이면 바로 보냅니다. 이 기기에만 저장되고 바로 적용됩니다."));
+    pane.appendChild(g2b);
 
     pane.appendChild(el("div", "group-title", "음성 입력 (입력창의 🎤)"));
     const g3 = el("div", "form-group");
@@ -1815,7 +1888,11 @@ function bind() {
         return;
       }
     }
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(); }
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      // 붙잡아 둔 메시지가 있고 입력창이 비어 있으면 Enter 한 번 더 = 바로 보내기
+      if (S.hold && !inp.value.trim() && !S.attachments.length) flushHold(); else sendMessage();
+    }
   });
   $("btnSend").onclick = sendMessage;
   $("modeBtn").onclick = (e) => { e.stopPropagation(); toggleModeMenu(); };

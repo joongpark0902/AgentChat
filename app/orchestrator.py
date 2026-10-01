@@ -75,6 +75,25 @@ def changed_between(before: dict, after: dict, limit: int = 60) -> list[str]:
     return changed[:limit]
 
 
+def _claude_keys(cfg: AppConfig) -> list[str]:
+    return [k for k, a in cfg.agents.items() if a.engine == "claude"]
+
+
+def _rules_off(cfg: AppConfig, state: dict, safe_mode: bool | None = None,
+               global_rules: dict | None = None) -> list[str]:
+    """전역 규칙을 끈 Claude 담당자. 저장된 대화 > 새 대화 요청(담당자별 > 일괄) > 설정 기본값 순."""
+    keys = _claude_keys(cfg)
+    if "rules_off" in state:
+        return [k for k in state["rules_off"] if k in keys]
+    if "safe_mode" in state:  # 10/1 이전 대화: 전원 일괄
+        return list(keys) if state["safe_mode"] else []
+    if isinstance(global_rules, dict):
+        return [k for k in keys if not global_rules.get(k, cfg.settings.rules_on(k))]
+    if safe_mode is not None:
+        return list(keys) if safe_mode else []
+    return [k for k in keys if not cfg.settings.rules_on(k)]
+
+
 def _title_from(messages: list[dict]) -> str:
     first = next((m for m in messages if m.get("sender") == "user"), None)
     return (first["text"] or (first.get("attachments") or [""])[0])[:40] if first else ""
@@ -84,7 +103,7 @@ class Room:
     def __init__(self, cfg: AppConfig, broadcast: Broadcast, runner_factory: RunnerFactory = make_runner,
                  conv_id: str | None = None, workspace: str | None = None, title: str | None = None,
                  safe_mode: bool | None = None, on_change: Callable[[], Awaitable[None]] | None = None,
-                 exclude: list[str] | None = None,
+                 exclude: list[str] | None = None, global_rules: dict | None = None,
                  on_limits: Callable[[str, dict], Awaitable[None]] | None = None,
                  on_meta: Callable[[dict], Awaitable[None]] | None = None,
                  slash_commands: Callable[[], list] | None = None):
@@ -102,6 +121,10 @@ class Room:
         self.task: asyncio.Task | None = None
         self._busy = False  # 과제 진행 중 여부(과제 마지막 상태 알림 시점에 task.done() 이 아직 False 라 따로 둠)
         self.pending: list[str] = []
+        self.pending_ids: list[str] = []       # pending 과 같은 순서의 사용자 메시지 id(전달 전이라 수정·취소 가능)
+        self.editable: dict | None = None      # 방금 시작한 지시 {id, agent, fresh}: 첫 답이 나오기 전까지 수정 가능
+        self._retracting = False               # 지시 수정 때문에 중단하는 중
+        self._correction = False               # 다음 지시 앞에 "직전 지시는 취소" 안내를 붙일지
         self.current_agent: str | None = None
         self.typing: dict[str, str] = {}
         self.round = 0
@@ -129,8 +152,8 @@ class Room:
                                     if k in cfg.agents and k != cfg.worker]
         self.compact_tip_shown = bool(state.get("compact_tip_shown", False))
         self.archived_at = state.get("archived_at")
-        self.safe_mode = state["safe_mode"] if "safe_mode" in state else \
-            (cfg.settings.claude_safe_mode if safe_mode is None else bool(safe_mode))
+        # 전역 규칙을 끈 Claude 담당자 목록(대화마다 고정). safe_mode=True/False 는 예전 방식(전원 일괄)
+        self.rules_off: list[str] = _rules_off(cfg, state, safe_mode, global_rules)
         ws = state.get("workspace") or workspace
         self.workspace = Path(ws) if ws else cfg.settings.workspace_root / self.conv_id
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -145,8 +168,8 @@ class Room:
         for k, st in state.get("sessions", {}).items():
             if k in self.runners:
                 self.runners[k].restore(st)
-        for r in self.runners.values():
-            r.safe_mode = self.safe_mode
+        for k, r in self.runners.items():
+            r.safe_mode = k in self.rules_off
         self._save_state()
 
     # ------------------------------------------------------------ 상태
@@ -175,9 +198,15 @@ class Room:
         return {"id": self.conv_id, "title": self.title or "새 대화", "workspace": str(self.workspace),
                 "updated": last["ts"] if last else self.created, "created": self.created,
                 "last": ((who + ": ") if who else "") + (last["text"][:80] if last else ""),
-                "running": self.running, "safe_mode": self.safe_mode, "archived": self.archived,
-                "excluded": self.excluded,
+                "running": self.running, "safe_mode": self.safe_mode, "rules_off": self.rules_off,
+                "archived": self.archived, "excluded": self.excluded,
                 "approvals": sum(1 for f in self.approvals.values() if not f.done())}
+
+    @property
+    def safe_mode(self) -> bool:
+        """예전 표시용: Claude 담당자 전원이 전역 규칙 OFF 인지."""
+        keys = _claude_keys(self.cfg)
+        return bool(keys) and all(k in self.rules_off for k in keys)
 
     @property
     def reviewers(self) -> list[str]:
@@ -210,12 +239,17 @@ class Room:
     def snapshot(self) -> dict:
         return {"type": "snapshot", "conv": self.conv_id, "summary": self.summary(), "messages": self.messages,
                 "running": self.running, "round": self.round, "typing": self.typing,
-                "typing_tokens": self.typing_tokens, "pending": len(self.pending), "contexts": self.contexts()}
+                "typing_tokens": self.typing_tokens, "pending": len(self.pending), "contexts": self.contexts(),
+                "editable": self.editable_ids()}
+
+    def editable_ids(self) -> list[str]:
+        """지금 수정할 수 있는 사용자 메시지: 전달 대기 중인 것 + 첫 답이 나오기 전의 방금 지시."""
+        return list(self.pending_ids) + ([self.editable["id"]] if self.editable else [])
 
     def _save_state(self) -> None:
         self.store.save_state({"conv_id": self.conv_id, "title": self.title, "created": self.created,
                                "workspace": str(self.workspace), "safe_mode": self.safe_mode,
-                               "archived": self.archived, "archived_at": self.archived_at,
+                               "rules_off": self.rules_off, "archived": self.archived, "archived_at": self.archived_at,
                                "excluded": self.excluded, "compact_tip_shown": self.compact_tip_shown,
                                "sessions": {k: r.state() for k, r in self.runners.items()},
                                "requirements": self.requirements, "seen": self.seen})
@@ -234,9 +268,16 @@ class Room:
 
     async def _post(self, sender: str, text: str, **extra) -> dict:
         msg = {"id": uuid.uuid4().hex[:12], "sender": sender, "text": text, "ts": time.time(), **extra}
+        closed = False
+        if self.editable and sender in self.cfg.agents and extra.get("kind") != "approval":
+            self.editable = None  # 담당자의 첫 답이 나왔다 → 그 지시는 더 이상 수정할 수 없음
+            closed = True
         self.messages.append(msg)
         self.store.append(msg, self._name(sender))
         await self.broadcast({"type": "message", "message": msg})
+        if closed:
+            await self.broadcast({"type": "state", "running": self.running, "round": self.round,
+                                  "pending": len(self.pending), "editable": self.editable_ids()})
         if self.on_change:
             await self.on_change()
         return msg
@@ -248,7 +289,7 @@ class Room:
 
     async def _state(self) -> None:
         await self.broadcast({"type": "state", "running": self.running, "round": self.round,
-                              "pending": len(self.pending)})
+                              "pending": len(self.pending), "editable": self.editable_ids()})
         if self.on_change:
             await self.on_change()
 
@@ -286,7 +327,7 @@ class Room:
             self._save_state()
         if self.archived:
             await self.set_archived(False)
-        await self._post("user", text, attachments=attachments, mode=mode)
+        posted = await self._post("user", text, attachments=attachments, mode=mode)
         body = text
         if attachments:
             body += "\n\n[첨부 파일 — 작업 폴더 기준 경로]\n" + "\n".join(f"- {p}" for p in attachments)
@@ -301,19 +342,64 @@ class Room:
             return
         if self.running:
             self.pending.append(body)
+            self.pending_ids.append(posted["id"])
             who = "·".join(self.cfg.agents[k].name for k in sorted(self.active)) or "다음 에이전트"
             await self._post("system", f"{who}의 현재 작업이 끝나면 다음 발언 차례에 이 지시를 전달합니다.")
             await self._state()
             return
+        note = ""
+        if self._correction:  # 직전 지시를 수정하려고 중단한 뒤의 첫 지시(세션에는 예전 지시가 남아 있음)
+            self._correction = False
+            note = "[정정] 직전 지시는 취소합니다. 하다 만 작업이 있으면 아래 지시에 맞게 정리하고, 아래 지시만 따르세요.\n\n"
+        agent_key = target or self.cfg.worker
+        self.editable = {"id": posted["id"], "agent": agent_key, "fresh": not self.runners[agent_key].started}
         if target:
             if attachments:
                 stripped += body[len(text):]
-            self._start(self._run_single(target, stripped))
+            self._start(self._run_single(target, note + stripped))
         elif mode == "quick":
-            self._start(self._run_single(self.cfg.worker, body))
+            self._start(self._run_single(self.cfg.worker, note + body))
         else:
-            self._start(self._run_task([body]))
+            # 수정하려고 중단할 때 남겨 둔 전달 대기 지시가 있으면 함께 시작한다
+            held, self.pending, self.pending_ids = list(self.pending), [], []
+            self._start(self._run_task(held + [note + body]))
         await self._state()
+
+    async def edit_message(self, msg_id: str) -> bool:
+        """사용자가 보낸 지시를 고치려고 되돌린다. 전달 대기 중이면 대기열에서 빼고, 방금 시작한 지시면 진행을 중단한다.
+        말풍선은 지우지 않고 '수정됨'으로 남긴다. 화면이 글·첨부를 입력창으로 되돌린다."""
+        msg = next((m for m in self.messages if m.get("id") == msg_id and m.get("sender") == "user"), None)
+        if not msg:
+            return False
+        if msg_id in self.pending_ids:
+            i = self.pending_ids.index(msg_id)
+            self.pending_ids.pop(i)
+            self.pending.pop(i)
+            await self._update(msg, retracted=True)
+            await self._state()
+            return True
+        ed = self.editable
+        if not ed or ed["id"] != msg_id:
+            return False
+        self.editable = None
+        held, held_ids = list(self.pending), list(self.pending_ids)
+        self._retracting = True
+        try:
+            await self.stop()
+        finally:
+            self._retracting = False
+        self.pending, self.pending_ids = held, held_ids  # stop 이 비운 전달 대기 지시는 다음 지시 때 함께 보낸다
+        runner = self.runners[ed["agent"]]
+        if ed["fresh"]:
+            # 이 담당자의 첫 지시였다 → 세션을 버리고 새로 시작하면 원래 지시가 없던 것과 같다
+            runner.restore({})
+        else:
+            # CLI 에 세션을 되감는 옵션이 없다(2026-09-30 claude 2.1.285 --help 확인) → 다음 지시에 정정 안내를 붙인다
+            self._correction = True
+        await self._update(msg, retracted=True)
+        self._save_state()
+        await self._state()
+        return True
 
     async def _slash(self, agent_key: str, command: str) -> None:
         """`/명령`은 감싸지 않고 그대로 CLI 에 보낸다(9/28 실측: 메시지를 감싸면 명령이 맨 앞이 아니라 실행되지 않았음)."""
@@ -335,7 +421,14 @@ class Room:
         self._start(self._run_single(agent_key, command, raw=True))
         await self._state()
 
+    def _stop_text(self, tail: str = "") -> str:
+        if self._retracting:  # 알림 쪽이 "사용자 요청으로 중단"으로 시작하는지 보고 푸시를 생략한다
+            return "사용자 요청으로 중단했습니다(지시 수정). 고친 지시를 보내 주세요."
+        return "사용자 요청으로 중단했습니다." + tail
+
     async def stop(self) -> None:
+        self.editable = None
+        self.pending_ids.clear()
         self.pending.clear()
         for f in self.approvals.values():
             if not f.done():
@@ -350,6 +443,8 @@ class Room:
             await self.task
         except (asyncio.CancelledError, Exception):
             pass
+        for r in self.runners.values():  # 중단 표시는 이번 중단까지만(다음 호출이 취소로 오인하지 않게)
+            r._cancelled = False
 
     # ------------------------------------------------------------ 승인
     def _approver(self, agent_key: str):
@@ -393,6 +488,7 @@ class Room:
         if self.pending:
             self.requirements.extend(self.pending)
             self.pending.clear()
+            self.pending_ids.clear()
 
     def _unseen(self, agent_key: str) -> list[str]:
         start = self.seen.get(agent_key, 0)
@@ -492,13 +588,15 @@ class Room:
             else:
                 await self._post("system", f"{self.cfg.agents[agent_key].name} 호출 실패: {res.error}")
         except (asyncio.CancelledError, CancelledRun):
-            await self._post("system", "사용자 요청으로 중단했습니다.")
+            await self._post("system", self._stop_text())
         except Exception as e:
             await self._post("system", f"오류: {type(e).__name__}: {e}")
         finally:
+            self.editable = None
             await self._finish()
             leftover = list(self.pending)
             self.pending.clear()
+            self.pending_ids.clear()
             self._busy = False
             await self._state()
             if leftover:
@@ -514,21 +612,26 @@ class Room:
         self.seen = {}
         feedback: list = []
         carry: list[str] = []  # 정상 종료 시 실무자에게 아직 전달 못 한 지시 → 새 과제로 이어감
+        # 3단계 진행: 라운드 1은 계획만 주고받고, 초안은 라운드 2부터(감독이 없으면 계획 단계가 의미 없어 기존 방식)
+        staged = cfg.settings.flow == "staged" and bool(self.reviewers)
+        max_rounds = max(2, cfg.settings.max_rounds) if staged else cfg.settings.max_rounds
         try:
-            for round_no in range(1, cfg.settings.max_rounds + 1):
+            for round_no in range(1, max_rounds + 1):
                 self.round = round_no
+                stage = ("plan" if round_no == 1 else "draft" if round_no == 2 else None) if staged else None
                 await self._state()
 
                 self._drain_pending()
                 new_reqs = self._unseen(cfg.worker)
                 before = await asyncio.to_thread(workspace_snapshot, self.workspace)
                 res = await self._call(cfg.worker, prompts.worker_prompt(
-                    round_no, self.requirements, new_reqs, feedback, user_name), schema=False)
+                    round_no, self.requirements, new_reqs, feedback, user_name, stage=stage), schema=False)
                 if not res.ok:
                     await self._post("system", f"{worker.name} 호출 실패: {res.error}\n과제를 멈춥니다.")
                     return
                 changed = changed_between(before, await asyncio.to_thread(workspace_snapshot, self.workspace))
-                await self._post(cfg.worker, res.text, round=round_no, usage=res.usage, changed_files=changed)
+                await self._post(cfg.worker, res.text, round=round_no, usage=res.usage, changed_files=changed,
+                                 **({"stage": stage} if stage else {}))
                 await self._maybe_compact_tip(cfg.worker, res.usage)
                 worker_report = res.text
                 if not self.reviewers:  # 이 대화에서 감독을 모두 뺀 경우
@@ -542,13 +645,13 @@ class Room:
                 review_prompts = {rk: prompts.review_prompt(
                     round_no, self.requirements, self._unseen(rk), worker, worker_report,
                     str(self.workspace), user_name, worker_unseen=self._worker_unseen(),
-                    changed_files=changed) for rk in self.reviewers}
+                    changed_files=changed, stage=stage) for rk in self.reviewers}
 
                 async def review_one(rk: str):
                     res = await self._call(rk, review_prompts[rk], schema=True)
 
                     def blind(r) -> bool:  # 바뀐 파일이 있는데 도구를 한 번도 안 쓰고 낸 승인(9/30: 보고문만 읽고 승인)
-                        return bool(r.ok and changed and r.tool_calls == 0
+                        return bool(r.ok and changed and r.tool_calls == 0 and stage != "plan"
                                     and parse_review(r.structured, r.text).approved)
 
                     if blind(res):
@@ -570,7 +673,8 @@ class Room:
                         review = parse_review(res.structured, res.text)
                         feedback.append((cfg.agents[rk], review))
                         await self._post(rk, review.to_text(), round=round_no, verdict=review.verdict,
-                                         review=review.to_dict(), usage=res.usage)
+                                         review=review.to_dict(), usage=res.usage,
+                                         **({"stage": stage} if stage else {}))
                 finally:
                     for j in jobs:
                         if not j.done():
@@ -582,8 +686,8 @@ class Room:
                 # 실무자가 아직 받지 못한 사용자 지시(검토 중 끼어든 것)가 있으면 승인이 나도 한 라운드 더 돈다
                 worker_behind = bool(self.pending or self._worker_unseen())
                 if all(r.approved for _, r in feedback):
-                    if worker_behind and round_no < cfg.settings.max_rounds:
-                        continue
+                    if stage == "plan" or (worker_behind and round_no < max_rounds):
+                        continue  # 계획 승인은 끝이 아니라 초안으로 넘어가는 신호
                     names = ", ".join(a.name for a, _ in feedback)
                     note = f" ({', '.join(failed)} 검토 실패로 제외)" if failed else ""
                     await self._post("system", f"라운드 {round_no}에서 {names} 모두 APPROVE — 완료했습니다{note}.\n"
@@ -597,19 +701,21 @@ class Room:
                                      escalation=True)
                     carry = self._worker_unseen()
                     return
-                if round_no == cfg.settings.max_rounds:
-                    await self._post("system", prompts.escalation_text(cfg.settings.max_rounds, feedback, user_name),
+                if round_no == max_rounds:
+                    await self._post("system", prompts.escalation_text(max_rounds, feedback, user_name),
                                      escalation=True)
                     carry = self._worker_unseen()
                     return
         except (asyncio.CancelledError, CancelledRun):
-            await self._post("system", "사용자 요청으로 중단했습니다. 새 지시를 주시면 이어서 진행합니다.")
+            await self._post("system", self._stop_text(" 새 지시를 주시면 이어서 진행합니다."))
         except Exception as e:  # 예기치 못한 오류도 채팅에 보이게
             await self._post("system", f"오류로 과제를 멈췄습니다: {type(e).__name__}: {e}")
         finally:
+            self.editable = None
             await self._finish()
             leftover = carry + list(self.pending)
             self.pending.clear()
+            self.pending_ids.clear()
             self._busy = False
             await self._state()
             if leftover:
@@ -664,13 +770,14 @@ class Manager:
         return room
 
     def create(self, workspace: str | None = None, title: str | None = None, safe_mode: bool | None = None,
-               exclude: list[str] | None = None) -> Room:
+               exclude: list[str] | None = None, global_rules: dict | None = None) -> Room:
         if workspace:
             p = Path(workspace)
             if not p.is_dir():
                 raise ValueError(f"폴더가 없습니다: {workspace}")
             self._remember_folder(str(p))
-        room = self._room(workspace=workspace, title=title, safe_mode=safe_mode, exclude=exclude)
+        room = self._room(workspace=workspace, title=title, safe_mode=safe_mode, exclude=exclude,
+                          global_rules=global_rules)
         self.rooms[room.conv_id] = room
         return room
 
@@ -692,7 +799,8 @@ class Manager:
                         "updated": last["ts"] if last else s.get("created", st.stat().st_mtime),
                         "created": s.get("created", st.stat().st_mtime),
                         "last": last["text"][:80] if last else "", "running": False,
-                        "safe_mode": s.get("safe_mode", False), "archived": bool(s.get("archived", False)),
+                        "safe_mode": s.get("safe_mode", False), "rules_off": _rules_off(self.cfg, s),
+                        "archived": bool(s.get("archived", False)),
                         "approvals": 0})
         out.sort(key=lambda x: x["updated"], reverse=True)
         return out

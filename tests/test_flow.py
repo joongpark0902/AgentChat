@@ -53,6 +53,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
         self.cfg = load_config()
         self.cfg.settings.log_dir = self.tmp / "logs"
         self.cfg.settings.workspace_root = self.tmp / "ws"
+        self.cfg.settings.flow = "classic"  # 실제 설정이 3단계여도 기존 흐름 테스트는 기존 방식으로
         self.events = []
         FakeRunner.calls = []
         FakeRunner.gate = None
@@ -320,12 +321,14 @@ class ServerTests(unittest.TestCase):
         def factory(cfg, bc):
             cfg.settings.log_dir = self.tmp / "logs"
             cfg.settings.workspace_root = self.tmp / "ws"
+            cfg.settings.flow = "classic"
             m = Manager(cfg, bc, runner_factory=FakeRunner)
             orig_reload = m.reload
 
             def reload(new_cfg):  # 설정 저장 후 다시 읽어도 임시 폴더를 쓰게
                 new_cfg.settings.log_dir = self.tmp / "logs"
                 new_cfg.settings.workspace_root = self.tmp / "ws"
+                new_cfg.settings.flow = "classic"
                 orig_reload(new_cfg)
             m.reload = reload
             return m

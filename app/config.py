@@ -68,6 +68,11 @@ class Settings:
     readonly_mcp_allow: list = None    # 감독(읽기 전용)이 묻지 않고 쓰는 MCP 서버
     remote_port: int = 8790            # 폰 전용 포트(127.0.0.1). Tailscale serve 가 여기로 넘겨주고, 항상 로그인 필요
     push_subject: str = ""             # 웹 푸시 VAPID 연락처(비우면 기본값)
+    claude_rules: dict = None          # 담당자별 전역 규칙 {key: True/False}. 없는 담당자는 safe_mode 를 따름
+    flow: str = "classic"              # classic: 라운드마다 완성본 / staged: 1 방향(계획) → 2 초안 → 3 마무리
+
+    def rules_on(self, key: str) -> bool:
+        return bool((self.claude_rules or {}).get(key, not self.claude_safe_mode))
 
 
 @dataclass
@@ -85,7 +90,7 @@ class AppConfig:
             user["avatar"] = f"/avatars/{user['avatar']}"
         return {"room_name": self.room_name, "user": user, "worker": self.worker,
                 "stt": {"engine": self.settings.stt_engine, "model": self.settings.stt_model},
-                "reviewers": self.reviewers, "max_rounds": self.settings.max_rounds,
+                "reviewers": self.reviewers, "max_rounds": self.settings.max_rounds, "flow": self.settings.flow,
                 "agents": {k: a.public() for k, a in self.agents.items()}}
 
 
@@ -179,7 +184,9 @@ def load_config(config_dir: Path | None = None) -> AppConfig:
         memory_dir=s.get("memory_dir") or default_memory_dir(),
         codex_approvals_reviewer=codex.get("approvals_reviewer", "auto_review"),
         readonly_mcp_allow=list(claude.get("readonly_mcp_allow") or DEFAULT_READONLY_MCP),
-        remote_port=int(s.get("remote_port", 8790)), push_subject=str(s.get("push_subject") or ""))
+        remote_port=int(s.get("remote_port", 8790)), push_subject=str(s.get("push_subject") or ""),
+        claude_rules={str(k): bool(v) for k, v in (claude.get("global_rules") or {}).items()},
+        flow="staged" if s.get("flow") == "staged" else "classic")
 
     for ag in agents.values():
         ag.memory_dir = settings.memory_dir
@@ -232,13 +239,19 @@ def editable_config(config_dir: Path | None = None) -> dict:
         agents[key] = {f: v.get(f) for f in EDITABLE_AGENT_FIELDS}
         agents[key]["checklist"] = [_as_text(c) for c in (v.get("checklist") or [])]
         agents[key]["engine"] = v.get("engine")
+    claude = s.get("claude") or {}
+    default_on = not bool(claude.get("safe_mode", False))
+    per_agent = claude.get("global_rules") or {}
+    # Codex 는 이 스위치와 무관하게 AGENTS.md 를 읽으므로 Claude 담당자만 둔다
+    rules_agents = {k: bool(per_agent.get(k, default_on)) for k, v in a["agents"].items() if v.get("engine") == "claude"}
     return {
         "room_name": a.get("room_name", "작업방"),
         "user_name": (a.get("user") or {}).get("name", "사용자"),
         "user_avatar": (a.get("user") or {}).get("avatar"),
         "agents": agents,
         "settings": {"max_rounds": s.get("max_rounds", 3), "call_timeout_sec": s.get("call_timeout_sec", 1200),
-                     "global_rules": not bool((s.get("claude") or {}).get("safe_mode", False)),
+                     "global_rules": default_on, "global_rules_agents": rules_agents,
+                     "flow": "staged" if s.get("flow") == "staged" else "classic",
                      "stt_engine": (s.get("stt") or {}).get("engine", "local"),
                      "stt_model": (s.get("stt") or {}).get("model", "small"),
                      "stt_vocab": list((s.get("stt") or {}).get("vocabulary") or DEFAULT_STT_VOCAB)},
@@ -284,8 +297,16 @@ def save_editable_config(patch: dict, config_dir: Path | None = None) -> str:
         s.setdefault("stt", {})["model"] = "base" if st["stt_model"] == "base" else "small"
     if "stt_vocab" in st:
         s.setdefault("stt", {})["vocabulary"] = [str(x).strip() for x in st["stt_vocab"] or [] if str(x).strip()]
-    if "global_rules" in st:
+    if "global_rules" in st:  # 예전 방식(전원 일괄): 담당자별 값을 지우고 한 값으로
         s.setdefault("claude", {})["safe_mode"] = not bool(st["global_rules"])
+        s["claude"].pop("global_rules", None)
+    if isinstance(st.get("global_rules_agents"), dict):
+        rules = {str(k): bool(v) for k, v in st["global_rules_agents"].items() if k in a["agents"]}
+        s.setdefault("claude", {})["global_rules"] = rules
+        if rules:  # 목록에 없는 담당자(새로 추가 등)의 기본값: 하나라도 켜져 있으면 켬
+            s["claude"]["safe_mode"] = not any(rules.values())
+    if "flow" in st:
+        s["flow"] = "staged" if st["flow"] == "staged" else "classic"
 
     agents_text, settings_text = _dump_yaml(a), _dump_yaml(s)
     with tempfile.TemporaryDirectory() as tmp:  # 저장 전에 실제로 읽히는지 검증
