@@ -10,7 +10,7 @@ const store = {
 };
 
 const S = {
-  ws: null, config: null, conversations: [], recent: [],
+  ws: null, config: null, conversations: [], recent: [], projects: [],
   conv: null,               // 열린 대화 id
   messages: [], typing: {}, running: false, round: 0, pending: 0, summary: null,
   mode: store.get("mode", "review"),
@@ -152,11 +152,36 @@ function renderSidebar() {
   }
   const list = S.conversations.filter((c) => !!c.archived === S.showArchived)
     .filter((c) => !q || (c.title + " " + c.last + " " + c.workspace).toLowerCase().includes(q));
+  if (!S.showArchived && !q) box.appendChild(projectToolbar());
   if (!list.length) {
     box.appendChild(el("div", "side-empty", q ? "검색 결과가 없습니다" : S.showArchived ? "보관한 대화가 없습니다." : "대화가 없습니다.<br>오른쪽 위 ✎ 로 새 대화를 시작하세요."));
   }
-  list.forEach((c) => {
-    const row = el("div", "conv" + (c.id === S.conv ? " active" : ""));
+  const grouped = !S.showArchived && !q && S.projects.length;  // 검색 중·보관함은 그냥 목록
+  if (grouped) {
+    const known = new Set(S.projects.map((p) => p.id));
+    [...S.projects].sort((a, b) => a.name.localeCompare(b.name, "ko")).forEach((p) => {
+      const items = list.filter((c) => c.project === p.id);
+      box.appendChild(projectHeader(p, items.length));
+      if (!collapsed().has(p.id)) items.forEach((c) => box.appendChild(convRow(c, true)));
+    });
+    const rest = list.filter((c) => !c.project || !known.has(c.project));
+    if (rest.length) {
+      box.appendChild(projectHeader(null, rest.length));
+      if (!collapsed().has("_none")) rest.forEach((c) => box.appendChild(convRow(c, false)));
+    }
+  } else list.forEach((c) => box.appendChild(convRow(c, false)));
+  renderSearchHits(box, q);
+  if (!S.showArchived && archivedN) {
+    const link = el("button", "archive-link bottom", `보관함 ${archivedN}`);
+    link.onclick = () => { S.showArchived = true; renderSidebar(); };
+    box.appendChild(link);
+  }
+}
+
+function convRow(c, inProject) {
+    const row = el("div", "conv" + (c.id === S.conv ? " active" : "") + (inProject ? " in-proj" : ""));
+    row.draggable = true;  // 프로젝트 제목 위로 끌어다 놓으면 옮겨짐
+    row.addEventListener("dragstart", (e) => { e.dataTransfer.setData(DRAG_CONV, c.id); e.dataTransfer.effectAllowed = "move"; });
     const ava = el("div", "conv-ava");
     order().forEach((k) => ava.appendChild(avatarEl(agent(k))));
     const body = el("div", "conv-body");
@@ -168,19 +193,248 @@ function renderSidebar() {
     more.onclick = (e) => { e.stopPropagation(); convMenu(c, more); };
     row.append(ava, body, more);
     row.onclick = () => openConv(c.id);
-    box.appendChild(row);
-  });
-  if (!S.showArchived && archivedN) {
-    const link = el("button", "archive-link bottom", `보관함 ${archivedN}`);
-    link.onclick = () => { S.showArchived = true; renderSidebar(); };
-    box.appendChild(link);
+    return row;
+}
+
+// ── 프로젝트(대화 묶음) v12
+const DRAG_CONV = "application/x-agentchat-conv";
+function collapsed() { return new Set(store.get("collapsedProjects") || []); }
+function toggleCollapsed(id) {
+  const s = collapsed(); s.has(id) ? s.delete(id) : s.add(id);
+  store.set("collapsedProjects", [...s]); renderSidebar();
+}
+function projectOf(convId) { const c = S.conversations.find((x) => x.id === convId); return c && S.projects.find((p) => p.id === c.project) || null; }
+
+function projectToolbar() {
+  const bar = el("div", "proj-bar");
+  const add = el("button", "proj-link", "+ 프로젝트");
+  add.onclick = () => openProjectModal(null);
+  const sug = el("button", "proj-link", "폴더 기준 묶기 제안");
+  sug.onclick = openSuggestModal;
+  bar.append(add, sug);
+  return bar;
+}
+
+function projectHeader(p, n) {
+  const id = p ? p.id : "_none";
+  const open = !collapsed().has(id);
+  const h = el("div", "proj-head" + (p ? "" : " none"), `<span class="caret">${open ? "▾" : "▸"}</span><span class="pname">${p ? "📁 " + esc(p.name) : "기타"}</span><span class="pcount">${n}</span>`);
+  h.title = p ? `${p.folder || "기본 폴더 없음"}${p.memo ? "\n메모: " + p.memo.slice(0, 120) : ""}` : "프로젝트에 넣지 않은 대화";
+  h.onclick = () => toggleCollapsed(id);
+  if (p) {
+    const more = el("button", "conv-more", "⋯");
+    more.title = "프로젝트 설정 (이름·폴더·메모)";
+    more.onclick = (e) => { e.stopPropagation(); openProjectModal(p); };
+    h.appendChild(more);
   }
+  h.addEventListener("dragover", (e) => { if ([...e.dataTransfer.types].includes(DRAG_CONV)) { e.preventDefault(); h.classList.add("drop"); } });
+  h.addEventListener("dragleave", () => h.classList.remove("drop"));
+  h.addEventListener("drop", (e) => {
+    h.classList.remove("drop");
+    const cid = e.dataTransfer.getData(DRAG_CONV);
+    if (cid) { e.preventDefault(); moveConv(cid, p ? p.id : null); }
+  });
+  return h;
+}
+
+async function moveConv(convId, pid) {
+  try {
+    await api("POST", `/api/conv/${convId}/project`, { project: pid });
+    const p = S.projects.find((x) => x.id === pid);
+    toast(p ? `'${p.name}' 프로젝트로 옮겼습니다${p.memo ? " — 다음 답변부터 프로젝트 메모가 적용됩니다" : ""}` : "프로젝트에서 뺐습니다");
+  } catch (e) { toast(e.message); }
+}
+
+function openMoveModal(c) {
+  const { body } = modal("프로젝트로 옮기기", "small");
+  const pane = el("div", "set-pane pad"); body.appendChild(pane);
+  const opts = [...S.projects.map((p) => [p.id, "📁 " + p.name]), [null, "프로젝트 없음 (기타)"]];
+  opts.forEach(([pid, label]) => {
+    const it = el("div", "inbox-item" + ((c.project || null) === pid ? " cur" : ""), `<b>${esc(label)}</b>`);
+    it.onclick = () => { closeModal(); moveConv(c.id, pid); };
+    pane.appendChild(it);
+  });
+  const nw = el("button", "btn gray", "+ 새 프로젝트를 만들어 옮기기");
+  nw.onclick = () => openProjectModal(null, [c.id]);
+  pane.appendChild(nw);
+}
+
+function openProjectModal(p, convIds) {
+  const { body, foot } = modal(p ? "프로젝트 설정" : "새 프로젝트", "small");
+  const pane = el("div", "set-pane pad"); body.appendChild(pane);
+  const g = el("div", "form-group");
+  const name = input(p?.name || "", "text", { placeholder: "예: A사 재무실사" });
+  const folder = input(p?.folder || "", "text", { placeholder: "C:\\Users\\...\\폴더 (비워도 됨)" });
+  const memo = textarea(p?.memo || "");
+  memo.placeholder = "예: 기준일 2025-12-31, 단위 원, 조서는 wp\\ 폴더, 비상장이라 외부 검색에 회사명 금지";
+  g.appendChild(formRow("이름", name));
+  const fr = formRow("기본 작업 폴더", folder, "이 프로젝트에서 새 대화를 열면 이 폴더에서 작업합니다.");
+  if (S.local) {
+    const b = el("button", "btn gray", "찾아보기…");
+    b.onclick = async () => { try { const d = await api("POST", "/api/pick-folder", { initial: folder.value || null }); if (d.path) folder.value = d.path; } catch (e) { toast(e.message); } };
+    fr.appendChild(b);
+  }
+  g.appendChild(fr);
+  g.appendChild(formRow("프로젝트 메모", memo, "이 프로젝트의 모든 대화에서 Jake·Clara·Eric 에게 공통 지시로 전달됩니다(바뀔 때만 다시 보냄). Eric 은 Codex(OpenAI)라 메모도 그쪽으로 갑니다 — 대화에서 Eric 을 빼면 보내지 않습니다.", true));
+  pane.appendChild(g);
+  if (p) {
+    const del = el("button", "btn gray danger", "프로젝트 삭제");
+    del.onclick = async () => {
+      if (!confirm(`'${p.name}' 프로젝트를 지울까요? 대화는 지우지 않고 '기타'로 옮깁니다.`)) return;
+      try { const d = await api("DELETE", `/api/projects/${p.id}`); closeModal(); toast(`프로젝트를 지웠습니다. 대화 ${d.moved}개는 '기타'로 옮겼습니다.`); }
+      catch (e) { toast(e.message); }
+    };
+    const nc = el("button", "btn gray", "이 프로젝트에서 새 대화");
+    nc.onclick = () => { closeModal(); openNewConvModal(p.id); };
+    foot.append(del, nc);
+  }
+  const cancel = el("button", "btn gray", "취소"); cancel.onclick = closeModal;
+  const ok = el("button", "btn primary", p ? "저장" : "만들기");
+  ok.onclick = async () => {
+    const data = { name: name.value, folder: folder.value, memo: memo.value };
+    try {
+      if (p) await api("PUT", `/api/projects/${p.id}`, data);
+      else await api("POST", "/api/projects", { ...data, conv_ids: convIds || [] });
+      closeModal(); toast(p ? "저장했습니다" : "프로젝트를 만들었습니다");
+    } catch (e) { toast(e.message); }
+  };
+  foot.append(cancel, ok);
+  name.focus();
+}
+
+async function openSuggestModal() {
+  let d;
+  try { d = await api("GET", "/api/projects/suggest"); } catch (e) { toast(e.message); return; }
+  const { body, foot } = modal("폴더 기준 묶기 제안", "small");
+  const pane = el("div", "set-pane pad"); body.appendChild(pane);
+  if (!d.groups.length) { pane.appendChild(el("div", "side-empty", "묶을 만한 대화가 없습니다.<br>(작업 폴더가 같거나 바로 위·아래인 대화가 2개 이상일 때 제안합니다)")); return; }
+  pane.appendChild(el("div", "hint", "작업 폴더가 같은 대화끼리 묶은 초안입니다. 이름을 고치고, 빼고 싶은 대화는 체크를 푼 뒤 적용을 누르세요. 적용 전에는 아무것도 바뀌지 않습니다."));
+  const forms = d.groups.map((g) => {
+    const box = el("div", "sug-group");
+    const use = el("input"); use.type = "checkbox"; use.checked = true;
+    const name = input(g.name);
+    const head = el("div", "sug-head"); head.append(use, name);
+    box.append(head, el("div", "hint", esc(g.folder)));
+    const checks = g.convs.map((c) => {
+      const cb = el("input"); cb.type = "checkbox"; cb.checked = true;
+      const row = el("label", "sug-conv"); row.append(cb, document.createTextNode(" " + c.title));
+      row.title = c.workspace;
+      box.appendChild(row);
+      return [c.id, cb];
+    });
+    pane.appendChild(box);
+    return { g, use, name, checks };
+  });
+  const cancel = el("button", "btn gray", "닫기"); cancel.onclick = closeModal;
+  const ok = el("button", "btn primary", "적용");
+  ok.onclick = async () => {
+    const groups = forms.filter((f) => f.use.checked).map((f) => ({ name: f.name.value, folder: f.g.folder, conv_ids: f.checks.filter(([, cb]) => cb.checked).map(([id]) => id) }))
+      .filter((g) => g.conv_ids.length);
+    if (!groups.length) { toast("적용할 묶음이 없습니다"); return; }
+    ok.disabled = true;
+    try { const r = await api("POST", "/api/projects/apply-suggestion", { groups }); closeModal(); toast(`프로젝트 ${r.created.length}개를 만들었습니다`); }
+    catch (e) { toast(e.message); ok.disabled = false; }
+  };
+  foot.append(cancel, ok);
+}
+
+// ── 지난 대화 전체 검색(메시지 내용) · 결정 대기함 (v11)
+let searchTimer = null;
+function onSearchInput() {
+  renderSidebar();
+  clearTimeout(searchTimer);
+  const q = $("search").value.trim();
+  if (q.length < 2) { S.searchHits = null; return; }
+  searchTimer = setTimeout(async () => {
+    try {
+      const sp = scopeProject();
+      const d = await api("GET", `/api/search?q=${encodeURIComponent(q)}` + (sp ? `&project=${sp.id}` : ""));
+      if ($("search").value.trim() === q) { S.searchHits = d; renderSidebar(); }
+    } catch (e) { /* 검색 실패는 조용히 — 제목 검색은 그대로 보임 */ }
+  }, 300);
+}
+
+function renderSearchHits(box, q) {
+  const d = S.searchHits;
+  if (!d || q.length < 2 || d.q.trim().toLowerCase() !== q) return;
+  box.querySelector(".side-empty")?.remove();
+  const head = el("div", "hit-head", d.results.length ? `메시지 내용 · ${d.results.length}개 대화` : "메시지 내용 · 결과 없음");
+  const cur = projectOf(S.conv);
+  if (cur || S.scopeProject) {
+    const t = el("button", "proj-link", S.scopeProject ? "전체에서 찾기" : `'${esc(cur?.name || "")}'에서만`);
+    t.onclick = () => { S.scopeProject = !S.scopeProject; S.searchHits = null; onSearchInput(); };
+    head.appendChild(t);
+  }
+  box.appendChild(head);
+  const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "ig");
+  d.results.forEach((r) => {
+    const g = el("div", "hit-conv");
+    g.appendChild(el("div", "hit-title", `${esc(r.title)} <span>${r.total}건${r.archived ? " · 보관" : ""}</span>`));
+    r.hits.forEach((h) => {
+      const who = h.sender === "user" ? userName() : h.sender === "system" ? "시스템" : agent(h.sender).name;
+      const it = el("div", "hit-item", `<b>${esc(who)}</b> ${esc(h.snippet).replace(re, (m) => `<mark>${m}</mark>`)}<i>${fmtTime(h.ts)}</i>`);
+      it.onclick = () => jumpTo(r.id, h.msg_id);
+      g.appendChild(it);
+    });
+    box.appendChild(g);
+  });
+}
+
+function jumpTo(convId, msgId) {
+  S.jumpTo = msgId;
+  if (S.conv === convId && S.messages.length) { scrollToJump(); if (narrow()) setLeftDrawer(false); }
+  else openConv(convId);
+}
+
+function scrollToJump() {
+  if (!S.jumpTo) return;
+  const node = document.querySelector(`#messages [data-id="${CSS.escape(S.jumpTo)}"]`);
+  S.jumpTo = null;
+  if (!node) { toast("그 메시지를 찾지 못했습니다"); return; }
+  node.scrollIntoView({ block: "center" });
+  node.classList.add("jump-hl");
+  setTimeout(() => node.classList.remove("jump-hl"), 2500);
+}
+
+function scopeProject() { return S.scopeProject ? projectOf(S.conv) : null; }
+
+async function loadInbox() {
+  try {
+    const sp = scopeProject();
+    const d = await api("GET", "/api/inbox" + (sp ? `?project=${sp.id}` : ""));
+    S.inbox = d.items || [];
+    $("inboxN").textContent = S.inbox.length;
+    $("btnInbox").classList.toggle("on", S.inbox.length > 0);
+    if (document.querySelector(".inbox-modal")) openInbox(true);
+  } catch (e) { /* 다음 갱신 때 다시 */ }
+}
+
+function openInbox(refresh) {
+  const items = S.inbox || [];
+  const { body } = modal(`결정 대기 ${items.length}건`, "inbox-modal");
+  if (!refresh) loadInbox();
+  const cur = projectOf(S.conv);
+  if (cur || S.scopeProject) {
+    const t = el("label", "scope-toggle");
+    const cb = el("input"); cb.type = "checkbox"; cb.checked = !!S.scopeProject;
+    cb.onchange = () => { S.scopeProject = cb.checked; loadInbox(); };
+    t.append(cb, document.createTextNode(` 이 프로젝트만${cur ? " (" + cur.name + ")" : ""}`));
+    body.appendChild(t);
+  }
+  if (!items.length) { body.appendChild(el("div", "side-empty", "기다리는 결정이 없습니다.")); return; }
+  const kinds = { approval: "실행 허락 대기", escalation: "검토 미합의·결정 필요", question: "확인 요청" };
+  items.forEach((it) => {
+    const row = el("div", "inbox-item", `<div class="ib-top"><span class="ib-kind ${esc(it.reason)}">${kinds[it.reason] || it.reason}</span><b>${esc(it.title)}</b><i>${fmtTime(it.ts)}</i></div><div class="ib-sum">${esc(it.summary || "")}</div>`);
+    row.onclick = () => { closeModal(); jumpTo(it.id, it.msg_id); };
+    body.appendChild(row);
+  });
 }
 
 function convMenu(c, anchor) {
   document.querySelector(".ctx-menu")?.remove();
   const m = el("div", "ctx-menu");
   const item = (label, fn, cls) => { const it = el("div", "menu-item" + (cls ? " " + cls : ""), `<div class="mi-title">${label}</div>`); it.onclick = () => { m.remove(); fn(); }; m.appendChild(it); };
+  item("프로젝트로 옮기기…", () => openMoveModal(c));
   if (c.archived) item("다시 꺼내기", () => archiveConv(c.id, false));
   else item("나가기 (보관)", () => archiveConv(c.id, true));
   (S.config.reviewers || []).forEach((k) => {
@@ -302,7 +556,8 @@ function renderMessage(msg, prev) {
     const a = agent(msg.sender);
     col.appendChild(el("div", "sender", `<b>${esc(a.name)}</b><span>${esc(a.title)}</span>` +
       (msg.verdict ? `<span class="badge ${esc(msg.verdict)}">${msg.verdict === "APPROVE" ? "승인" : "수정 요청"}</span>` : "") +
-      (msg.round ? `<span class="round">${roundLabel(msg)}</span>` : "")));
+      (msg.round ? `<span class="round">${roundLabel(msg)}</span>` : "") +
+      (msg.final ? `<span class="round">${esc(userName())}께 최종 보고</span>` : "")));
   } else if (!isUser && msg.verdict) {
     col.appendChild(el("div", "sender", `<span class="badge ${esc(msg.verdict)}">${msg.verdict === "APPROVE" ? "승인" : "수정 요청"}</span>` +
       (msg.round ? `<span class="round">${roundLabel(msg)}</span>` : "")));
@@ -535,13 +790,13 @@ function connect() {
     const mine = d.conv && d.conv === S.conv;
     switch (d.type) {
       case "init":
-        S.config = d.config; S.conversations = d.conversations; S.recent = d.recent_folders || [];
+        S.config = d.config; S.conversations = d.conversations; S.recent = d.recent_folders || []; S.projects = d.projects || [];
         S.limits = d.limits || {};
         S.slash = d.slash_commands || [];
         S.local = d.client ? !!d.client.local : true;
         document.body.classList.toggle("remote", !S.local);
         S.conversations.forEach((c) => { S.prevRunning[c.id] = !!c.running; });
-        renderSidebar(); renderUsage();
+        renderSidebar(); renderUsage(); loadInbox();
         { const fromHash = (location.hash.match(/conv=([^&]+)/) || [])[1];  // 알림을 눌러 열었을 때
           if (fromHash) history.replaceState(null, "", location.pathname);
           const last = store.get("conv"); const pick = S.conversations.find((c) => c.id === (fromHash && decodeURIComponent(fromHash))) || S.conversations.find((c) => c.id === (S.conv || last)) || S.conversations[0];
@@ -554,6 +809,7 @@ function connect() {
         S.contexts = d.contexts || {};
         S.editable = d.editable || [];
         renderAll();
+        if (S.jumpTo) scrollToJump();
         if (S.filesOpen) loadFiles();
         break;
       case "message": if (mine) { appendMessage(d.message); renderStatus(); } break;
@@ -583,7 +839,9 @@ function connect() {
         break;
       case "conversations":
         S.conversations = d.conversations;
+        if (d.projects) S.projects = d.projects;
         notifyFinished();
+        loadInbox();
         { const c = S.conversations.find((x) => x.id === S.conv); if (c) { S.summary = { ...S.summary, ...c }; renderHeader(); } }
         renderSidebar();
         break;
@@ -1001,10 +1259,33 @@ function attachWorkspaceFile(path) {
   $("input").focus();
 }
 
+const ICON_COPY = '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/></svg>';
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp)$/i;
+
+// 이미지를 클립보드로(엑셀·PPT·카톡에 바로 붙여넣기). 브라우저 클립보드는 PNG 만 받으므로 다른 형식은 PNG 로 바꿔 넣는다
+async function copyImage(url) {
+  if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
+    toast("이 브라우저에서는 이미지 복사가 안 됩니다. 이미지를 오른쪽 클릭 → '이미지 복사'를 써 주세요.", 5000); return;
+  }
+  try {
+    const png = (async () => {
+      const blob = await (await fetch(url)).blob();
+      if (blob.type === "image/png") return blob;
+      const bmp = await createImageBitmap(blob);
+      const c = document.createElement("canvas"); c.width = bmp.width; c.height = bmp.height;
+      c.getContext("2d").drawImage(bmp, 0, 0);
+      return await new Promise((ok) => c.toBlob(ok, "image/png"));
+    })();
+    await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);  // Safari 는 Promise 를 넘겨야 함
+    toast("이미지를 복사했습니다. 붙여넣기(Ctrl+V) 하시면 됩니다.");
+  } catch (e) { toast(`이미지 복사 실패: ${e.message}`, 5000); }
+}
+
 function fileActions(path, withExpand) {
   const box = el("div", "pv-actions");
   const mk = (icon, title, fn) => { const b = el("button", "icon-btn sm", icon); b.title = title; b.onclick = fn; box.appendChild(b); };
   mk(ICON.clip.replace('width="13" height="13"', ""), "채팅에 첨부", () => { attachWorkspaceFile(path); if (narrow()) toggleFiles(false); });
+  if (IMAGE_EXT.test(path)) mk(ICON_COPY, "이미지 복사 (엑셀·PPT·카톡에 붙여넣기)", () => copyImage(`/api/conv/${S.conv}/raw?path=${encodeURIComponent(path)}`));
   if (withExpand) mk(ICON_EXPAND, "넓게 보기", () => openViewer(path));
   if (!S.local) {  // 폰: PC 프로그램으로 열 수 없으니 원본 파일을 새 탭으로(아이폰 미리보기·공유)
     mk(ICON_APP, "원본 파일 열기·저장", () => window.open(`/api/conv/${S.conv}/raw?path=${encodeURIComponent(path)}`, "_blank"));
@@ -1367,7 +1648,7 @@ function switchEl(checked) {
 }
 
 // ────────────────────────────────────────────────────────── 새 대화
-function openNewConvModal() {
+function openNewConvModal(projectId) {
   const { body, foot } = modal("새 대화", "small");
   const pane = el("div", "set-pane pad");
   body.appendChild(pane);
@@ -1375,6 +1656,10 @@ function openNewConvModal() {
   const g = el("div", "form-group");
   const title = input("", "text", { placeholder: "비워두면 첫 메시지로 자동 지정" });
   g.appendChild(formRow("제목", title));
+  const proj = el("select");
+  [["", "없음"], ...S.projects.map((p) => [p.id, p.name])].forEach(([v, l]) => { const o = el("option", "", esc(l)); o.value = v; proj.appendChild(o); });
+  proj.value = projectId ?? (projectOf(S.conv)?.id || "");  // 지금 보는 대화의 프로젝트를 기본으로
+  if (S.projects.length) g.appendChild(formRow("프로젝트", proj, "프로젝트를 고르면 그 프로젝트의 기본 폴더·메모를 씁니다."));
   pane.appendChild(g);
 
   pane.appendChild(el("div", "group-title", "작업 폴더"));
@@ -1407,6 +1692,8 @@ function openNewConvModal() {
   pane.appendChild(g2);
   bNew.onclick = () => { kind = "new"; bNew.classList.add("on"); bOld.classList.remove("on"); pickRow.classList.add("hidden"); };
   bOld.onclick = () => { kind = "old"; bOld.classList.add("on"); bNew.classList.remove("on"); pickRow.classList.remove("hidden"); };
+  const syncProject = () => { const p = S.projects.find((x) => x.id === proj.value); if (p?.folder) { path.value = p.folder; bOld.onclick(); } };
+  proj.onchange = syncProject; syncProject();
 
   const g3 = el("div", "form-group");
   g3.appendChild(el("div", "form-row", `<div class="hint" style="flex:1"><b>전역 규칙 적용</b> — ${esc(userName())}의 전역 규칙(CLAUDE.md·AGENTS.md)·플러그인을 담당자별로 싣습니다. 끄면 역할 지침만 쓰고 더 빠르고 가볍습니다. 대화마다 고정됩니다.</div>`));
@@ -1446,7 +1733,7 @@ function openNewConvModal() {
     if (kind === "old" && !path.value.trim()) { toast("작업할 폴더를 골라 주세요"); return; }
     ok.disabled = true;
     try {
-      const d = await api("POST", "/api/conversations", { title: title.value.trim() || null, workspace: kind === "old" ? path.value.trim() : null, global_rules: Object.fromEntries(Object.entries(ruleSw).map(([k, sw]) => [k, sw.input.checked])), exclude: exSw?.input.checked ? codexKeys : [] });
+      const d = await api("POST", "/api/conversations", { title: title.value.trim() || null, workspace: kind === "old" ? path.value.trim() : null, project: proj.value || null, global_rules: Object.fromEntries(Object.entries(ruleSw).map(([k, sw]) => [k, sw.input.checked])), exclude: exSw?.input.checked ? codexKeys : [] });
       S.conversations = [d.summary, ...S.conversations.filter((c) => c.id !== d.id)];
       if (kind === "old" && !S.recent.includes(path.value.trim())) S.recent.unshift(path.value.trim());
       closeModal();
@@ -1915,7 +2202,8 @@ function bind() {
   $("drawerBack").onclick = closeDrawers;
   document.addEventListener("visibilitychange", sendPresence);
   window.matchMedia("(max-width: 860px)").addEventListener("change", () => { if (!narrow()) $("app").classList.remove("drawer-left"); syncDrawerBack(); syncPlaceholder(); });
-  $("search").addEventListener("input", renderSidebar);
+  $("search").addEventListener("input", onSearchInput);
+  $("btnInbox").onclick = () => openInbox();
   document.addEventListener("click", (e) => {
     if (!e.target.closest("#modeMenu") && e.target !== $("modeBtn")) $("modeMenu").classList.add("hidden");
   });
@@ -1935,6 +2223,17 @@ function bind() {
   window.addEventListener("drop", (e) => {
     e.preventDefault(); dragDepth = 0; $("dropOverlay").classList.add("hidden");
     if (e.dataTransfer.files.length) attachFiles([...e.dataTransfer.files]);
+  });
+  // 캡처한 이미지를 입력창에 붙여넣기(Ctrl+V) → 첨부. 클립보드 이미지는 이름이 'image.png' 라 시각을 붙여 구분
+  $("input").addEventListener("paste", (e) => {
+    const files = [...(e.clipboardData?.items || [])].filter((i) => i.kind === "file").map((i) => i.getAsFile()).filter(Boolean);
+    if (!files.length) return;  // 글자 붙여넣기는 그대로
+    e.preventDefault();
+    const d = new Date(), p2 = (n) => String(n).padStart(2, "0");  // 한국 시각(toISOString 은 UTC)
+    const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+    attachFiles(files.map((f, i) => /^image\.\w+$/i.test(f.name) || !f.name
+      ? new File([f], `붙여넣기_${stamp}${files.length > 1 ? "_" + (i + 1) : ""}.${(f.type.split("/")[1] || "png").replace("jpeg", "jpg")}`, { type: f.type })
+      : f));
   });
   // 파일 패널의 파일을 대화 쪽으로 끌어다 놓기
   const col = document.querySelector(".thread-col");

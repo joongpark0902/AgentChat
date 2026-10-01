@@ -23,8 +23,13 @@ class FakeRunner(BaseRunner):
     scripts: dict = {}
     calls: list = []
     gate: asyncio.Event | None = None
+    final_ok = True
+    finals: list = []
 
     async def run(self, prompt, workspace, schema_path=None, activity=None, approve=None, **kw):
+        if "[최종 보고] 라운드가 끝났습니다" in prompt and FakeRunner.final_ok:  # 과제 끝 최종 보고: 대본·호출 기록과 별도
+            FakeRunner.finals.append((self.agent.key, prompt))
+            return RunResult(ok=True, text="사장님, 최종 보고드립니다.", session_id=self.session_id)
         FakeRunner.calls.append((self.agent.key, prompt, schema_path))
         if activity:
             activity("실행 중: python test.py")
@@ -56,6 +61,7 @@ class Base(unittest.IsolatedAsyncioTestCase):
         self.cfg.settings.flow = "classic"  # 실제 설정이 3단계여도 기존 흐름 테스트는 기존 방식으로
         self.events = []
         FakeRunner.calls = []
+        FakeRunner.finals = []
         FakeRunner.gate = None
 
     def tearDown(self):
@@ -86,8 +92,13 @@ class FlowTests(Base):
         FakeRunner.scripts = {"jake": ["fib 작성함"], "clara": [review("APPROVE")], "quinn": [review("APPROVE")]}
         room = self.room()
         await self.run_to_end(room, "피보나치 함수 작성")
-        self.assertEqual(self.senders(room), ["user", "jake", "clara", "quinn", "system"])
+        # 라운드가 끝나면 진행 기록(시스템) 뒤에 실무자가 사장님께 최종 보고
+        self.assertEqual(self.senders(room), ["user", "jake", "clara", "quinn", "system", "jake"])
         self.assertTrue(room.messages[-1].get("done"))
+        self.assertTrue(room.messages[-1].get("final"))
+        self.assertIn("모두 APPROVE", FakeRunner.finals[0][1])
+        self.assertIn("팀 내부 보고", FakeRunner.calls[0][1])   # 라운드 중 실무자는 감독에게 보고
+        self.assertIn("팀 내부 의견", FakeRunner.calls[1][1])   # 감독은 실무자에게
         self.assertIn("피보나치 함수 작성", FakeRunner.calls[0][1])
         self.assertIn("fib 작성함", FakeRunner.calls[1][1])
         self.assertIsNone(FakeRunner.calls[0][2])      # 실무자는 스키마 없음
@@ -114,7 +125,7 @@ class FlowTests(Base):
         }
         room = self.room()
         await self.run_to_end(room, "피보나치")
-        self.assertEqual(self.senders(room), ["user", "jake", "clara", "quinn", "jake", "clara", "quinn", "system"])
+        self.assertEqual(self.senders(room), ["user", "jake", "clara", "quinn", "jake", "clara", "quinn", "system", "jake"])
         self.assertIn("음수 입력 요건 누락", self.called("jake")[1])
         self.assertIn("라운드 2", self.called("jake")[1])
 
@@ -124,10 +135,11 @@ class FlowTests(Base):
                               "quinn": [review("REVISE", ("blocker", "재귀라 fib(50) 안 끝남"))] * n}
         room = self.room()
         await self.run_to_end(room, "피보나치")
-        last = room.messages[-1]
-        self.assertTrue(last.get("escalation"))
-        self.assertIn("재귀라 fib(50) 안 끝남", last["text"])
-        self.assertIn("사장님께 넘깁니다", last["text"])
+        self.assertTrue(room.messages[-1].get("escalation"))   # 최종 보고에 '판단 필요' 표시(알림 문구)
+        log = room.messages[-2]                                  # 감독 지적 원문은 진행 기록에 그대로
+        self.assertIn("재귀라 fib(50) 안 끝남", log["text"])
+        self.assertIn("사장님께 넘깁니다", log["text"])
+        self.assertIn("재귀라 fib(50) 안 끝남", FakeRunner.finals[0][1])
 
     async def test_quick_mode_only_worker(self):
         FakeRunner.scripts = {"jake": ["바로 답변"], "clara": [], "quinn": []}
@@ -151,7 +163,7 @@ class FlowTests(Base):
         FakeRunner.scripts = {"jake": ["v1"], "clara": [review("APPROVE")], "quinn": [review("APPROVE")]}
         room = self.room()
         await self.run_to_end(room, "@nobody 안녕")
-        self.assertEqual(self.senders(room)[-1], "system")
+        self.assertEqual(self.senders(room)[-2:], ["system", "jake"])
 
     async def test_attachments_in_prompt(self):
         FakeRunner.scripts = {"jake": ["읽었습니다"], "clara": [], "quinn": []}
@@ -222,7 +234,7 @@ class FlowTests(Base):
         await room.task
         self.assertEqual(len(self.called("jake")), 2)
         self.assertIn("README 도", self.called("jake")[1])
-        self.assertIn("라운드 2", room.messages[-1]["text"])
+        self.assertIn("라운드 2", room.messages[-2]["text"])
 
     async def test_last_round_unseen_instruction_carried_to_new_task(self):
         self.cfg.settings.max_rounds = 1

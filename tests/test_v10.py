@@ -24,7 +24,7 @@ class Staged(Base):
         room = self.room()
         await self.run_to_end(room, "손익 요약표")
         # 계획을 둘 다 승인해도 끝나지 않고 초안으로 넘어간다
-        self.assertEqual(self.senders(room), ["user", "jake", "clara", "quinn", "jake", "clara", "quinn", "system"])
+        self.assertEqual(self.senders(room), ["user", "jake", "clara", "quinn", "jake", "clara", "quinn", "system", "jake"])
         jake = self.called("jake")
         self.assertIn("방향 잡기", jake[0])
         self.assertIn("본 작업(산출물 작성·계산)을 하지 말고", jake[0])
@@ -34,7 +34,7 @@ class Staged(Base):
         self.assertEqual(room.messages[1].get("stage"), "plan")
         self.assertEqual(room.messages[4].get("stage"), "draft")
         self.assertTrue(room.messages[-1].get("done"))
-        self.assertIn("라운드 2", room.messages[-1]["text"])
+        self.assertIn("라운드 2", room.messages[-2]["text"])
 
     async def test_round3_then_escalate_to_user(self):
         FakeRunner.scripts = {"jake": ["계획", "초안", "마무리"],
@@ -44,10 +44,9 @@ class Staged(Base):
         await self.run_to_end(room, "손익 요약표")
         self.assertEqual(len(self.called("jake")), 3)
         self.assertIn("[라운드 3]", self.called("jake")[2])
-        last = room.messages[-1]
-        self.assertTrue(last.get("escalation"))
-        self.assertIn("3라운드 안에", last["text"])
-        self.assertIn("합계 불일치", last["text"])
+        self.assertTrue(room.messages[-1].get("escalation"))
+        self.assertIn("3라운드 안에", room.messages[-2]["text"])
+        self.assertIn("합계 불일치", room.messages[-2]["text"])
 
     async def test_plan_revise_feedback_reaches_draft(self):
         FakeRunner.scripts = {"jake": ["계획", "초안"],
@@ -134,6 +133,28 @@ class ConfigRules(unittest.TestCase):
         cfg = load_config(self.tmp)
         self.assertFalse(cfg.settings.rules_on("jake"))
         self.assertFalse(cfg.settings.rules_on("clara"))
+
+
+class FinalReport(Base):
+    async def test_final_report_failure_falls_back_to_system(self):
+        FakeRunner.final_ok = False  # 최종 보고 호출도 대본에서 꺼냄 → None = 실패
+        try:
+            FakeRunner.scripts = {"jake": ["v1", None], "clara": [review("APPROVE")], "quinn": [review("APPROVE")]}
+            room = self.room()
+            await self.run_to_end(room, "손익 요약표")
+        finally:
+            FakeRunner.final_ok = True
+        last = room.messages[-1]
+        self.assertEqual(last["sender"], "system")
+        self.assertTrue(last.get("done"))  # 알림은 그대로 '완료'
+        self.assertIn("최종 보고 실패", last["text"])
+
+    async def test_no_reviewers_no_extra_report(self):
+        FakeRunner.scripts = {"jake": ["완성"], "clara": [], "quinn": []}
+        room = self.room(exclude=["clara", "quinn"])
+        await self.run_to_end(room, "손익 요약표")
+        self.assertEqual(FakeRunner.finals, [])
+        self.assertNotIn("팀 내부 보고", self.called("jake")[0])  # 감독이 없으면 바로 사장님께 보고
 
 
 if __name__ == "__main__":

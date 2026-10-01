@@ -26,8 +26,51 @@ STAGED_PLAN_REVIEW = (
     "계획대로 가도 되면 APPROVE 입니다(승인해도 라운드 2 초안으로 넘어갑니다).")
 
 
+# 10/1: 사용자 요청 — 라운드 중에는 셋이 서로에게 보고하고, 사용자는 과제가 끝났을 때만 불러 보고한다
+TEAM_WORKER = ("(이 보고는 {user}이 아니라 {reviewers}에게 하는 팀 내부 보고입니다. {user}을 부르지 말고 "
+               "'{reviewers_call}'으로 시작하세요. {user}께는 과제가 끝난 뒤 따로 최종 보고를 합니다.)")
+TEAM_REVIEW = ("(이 판정은 {user}이 아니라 {worker}에게 주는 팀 내부 의견입니다. summary 는 {user}을 부르지 말고 "
+               "'{worker},'로 시작하세요. {user}께는 과제가 끝난 뒤 {worker}가 최종 보고를 합니다.)")
+
+
+def _team_note_worker(reviewers: list[AgentConfig] | None, user_name: str) -> str | None:
+    if not reviewers:
+        return None
+    names = "·".join(r.name for r in reviewers)
+    return TEAM_WORKER.format(user=user_name, reviewers=names, reviewers_call=", ".join(r.name for r in reviewers) + ",")
+
+
+# 10/1 사용자 결정: 비슷한 지난 작업이 1건 이상이면 먼저 추천, 메모(가)·스킬(나) 중 실무자가 골라 추천. 승인 전엔 아무것도 쓰지 않음
+REPEAT_RECOMMEND = (
+    "[비슷한 지난 작업 — 제목·지시의 주제 단어가 겹친 대화]\n{listing}\n"
+    "위 대화가 이번 과제와 실제로 같은 종류의 작업이면, ④ 확인 요청에 '반복 작업 추천' 항목을 넣어 주세요: "
+    "몇 번째인지(날짜), 정리해 둘 내용(작업 순서·확인 항목·자주 틀린 점), 그리고 (가) 메모리 메모 한 장 / "
+    "(나) 이름으로 부르는 스킬 중 어느 쪽을 추천하는지와 이유. 단어만 겹치고 작업 종류가 다르면 넣지 마세요. "
+    "{user}이 승인하기 전에는 메모·스킬을 만들지 마세요(승인하면 메모는 {memory_dir} 에 씁니다).")
+
+
+def final_report_prompt(outcome: str, detail: str, user_name: str, similar: list[dict] | None = None,
+                        memory_dir: str = "") -> str:
+    """라운드가 모두 끝난 뒤 실무자가 사용자에게 하는 최종 보고(추가 작업 없음)."""
+    parts = [
+        f"[최종 보고] 라운드가 끝났습니다. 결과: {outcome}",
+        f"[진행 기록]\n{detail}",
+        f"이제 {user_name}께 보고합니다. '{user_name},'으로 시작해 ① 결론 ② 만든/고친 파일 경로 ③ 직접 확인한 결과 "
+        f"④ 확인 요청({user_name}이 정할 사안·남은 쟁점, 없으면 생략)을 짧게 적어 주세요. "
+        "팀 내부에서 오간 지적·답변은 결론에 필요한 것만 요약하고, 파일 수정이나 추가 작업은 하지 마세요.",
+    ]
+    if similar:
+        from datetime import datetime
+        listing = "\n".join(
+            f"- {datetime.fromtimestamp(s['updated']).strftime('%m/%d') if s.get('updated') else '날짜 모름'} "
+            f"「{s['title']}」 (겹친 단어: {', '.join(s['shared'])})" for s in similar)
+        parts.append(REPEAT_RECOMMEND.format(listing=listing, user=user_name, memory_dir=memory_dir or "메모리 폴더"))
+    return "\n\n".join(parts)
+
+
 def worker_prompt(round_no: int, requirements: list[str], new_requirements: list[str],
-                  feedback: list[tuple[AgentConfig, Review]], user_name: str, stage: str | None = None) -> str:
+                  feedback: list[tuple[AgentConfig, Review]], user_name: str, stage: str | None = None,
+                  reviewers: list[AgentConfig] | None = None) -> str:
     if stage == "plan":
         parts = [f"[{user_name}의 지시]\n{_numbered(requirements)}", STAGED_PLAN_WORKER.format(user=user_name)]
     elif round_no == 1 and not feedback:
@@ -43,6 +86,9 @@ def worker_prompt(round_no: int, requirements: list[str], new_requirements: list
                          f"과제가 끝날 때 {user_name}께 따로 넘어갑니다.)")
     if new_requirements and stage != "plan" and not (round_no == 1 and not feedback):
         parts.append(f"[{user_name}이 새로 추가한 지시 — 최우선 반영]\n{_numbered(new_requirements)}")
+    note = _team_note_worker(reviewers, user_name)
+    if note:
+        parts.append(note)
     return "\n\n".join(parts)
 
 
@@ -75,6 +121,7 @@ def review_prompt(round_no: int, requirements: list[str], new_requirements: list
         parts.append("라운드 2 이상입니다. 직전 라운드에 당신이 지적한 것이 해결됐는지와 이번에 바뀐 파일만 확인하세요. "
                      "이미 확인해 통과시킨 항목은 다시 검증하지 않습니다.")
     parts.append(NEEDS_USER_RULE.format(worker=worker.name, user=user_name))
+    parts.append(TEAM_REVIEW.format(worker=worker.name, user=user_name))
     if stage == "plan":
         parts.append(f"작업 폴더는 {workspace} 입니다. 당신의 체크리스트 범위만, 짧게 JSON 으로 답해 주세요.")
     else:

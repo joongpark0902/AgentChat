@@ -18,7 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 
-from . import prompts
+from . import inbox, prompts
+from .projects import ProjectStore, memo_block, memo_signature, suggest_groups
 from .config import AppConfig
 from .logstore import LogStore
 from .runners import BaseRunner, CancelledRun, make_runner
@@ -106,8 +107,10 @@ class Room:
                  exclude: list[str] | None = None, global_rules: dict | None = None,
                  on_limits: Callable[[str, dict], Awaitable[None]] | None = None,
                  on_meta: Callable[[dict], Awaitable[None]] | None = None,
-                 slash_commands: Callable[[], list] | None = None):
+                 slash_commands: Callable[[], list] | None = None,
+                 projects: ProjectStore | None = None, project: str | None = None):
         self.cfg = cfg
+        self.projects = projects or ProjectStore(cfg.settings.log_dir)
         self.on_limits = on_limits
         self.on_meta = on_meta
         self.slash_commands = slash_commands or (lambda: [])
@@ -154,6 +157,9 @@ class Room:
         self.archived_at = state.get("archived_at")
         # 전역 규칙을 끈 Claude 담당자 목록(대화마다 고정). safe_mode=True/False 는 예전 방식(전원 일괄)
         self.rules_off: list[str] = _rules_off(cfg, state, safe_mode, global_rules)
+        self.project: str | None = state.get("project") if "project" in state else project
+        # 담당자별로 마지막에 보낸 프로젝트 메모 표시(memo_signature). 바뀌었을 때만 다시 보내거나 해제를 알린다
+        self.memo_sent: dict[str, str] = dict(state.get("memo_sent") or {})
         ws = state.get("workspace") or workspace
         self.workspace = Path(ws) if ws else cfg.settings.workspace_root / self.conv_id
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -199,7 +205,7 @@ class Room:
                 "updated": last["ts"] if last else self.created, "created": self.created,
                 "last": ((who + ": ") if who else "") + (last["text"][:80] if last else ""),
                 "running": self.running, "safe_mode": self.safe_mode, "rules_off": self.rules_off,
-                "archived": self.archived, "excluded": self.excluded,
+                "archived": self.archived, "excluded": self.excluded, "project": self.project,
                 "approvals": sum(1 for f in self.approvals.values() if not f.done())}
 
     @property
@@ -252,7 +258,8 @@ class Room:
                                "rules_off": self.rules_off, "archived": self.archived, "archived_at": self.archived_at,
                                "excluded": self.excluded, "compact_tip_shown": self.compact_tip_shown,
                                "sessions": {k: r.state() for k, r in self.runners.items()},
-                               "requirements": self.requirements, "seen": self.seen})
+                               "requirements": self.requirements, "seen": self.seen,
+                               "project": self.project, "memo_sent": self.memo_sent})
 
     async def broadcast(self, payload: dict) -> None:
         payload["conv"] = self.conv_id
@@ -499,8 +506,23 @@ class Room:
         """실무자가 아직 받지 못한 지시(감독 차례에 대기열에서 꺼낸 것)."""
         return self.requirements[self.seen.get(self.cfg.worker, 0):]
 
-    async def _call(self, agent_key: str, prompt: str, schema: bool):
+    def _memo_prefix(self, agent_key: str) -> tuple[str, str]:
+        """(이번 호출 앞에 붙일 프로젝트 메모 안내, 보낸 뒤 기록할 표시). 새 세션이면 예전에 보낸 메모는 없는 것으로 본다."""
         runner = self.runners[agent_key]
+        prev = self.memo_sent.get(agent_key, "") if runner.started else ""
+        project = self.projects.get(self.project)
+        return memo_block(project, prev), memo_signature(project)
+
+    async def set_project(self, pid: str | None) -> None:
+        self.project = pid or None
+        self._save_state()
+        if self.on_change:
+            await self.on_change()
+
+    async def _call(self, agent_key: str, prompt: str, schema: bool, memo: bool = True):
+        runner = self.runners[agent_key]
+        prefix, sig = self._memo_prefix(agent_key) if memo else ("", None)
+        prompt = prefix + prompt
         engine = self.cfg.agents[agent_key].engine
         self.current_agent = agent_key
         self.active.add(agent_key)
@@ -526,6 +548,8 @@ class Room:
                                    activity=activity, approve=self._approver(agent_key), on_limits=limits, on_meta=meta)
             if res.limits:
                 limits(res.limits)
+            if res.ok and sig is not None:
+                self.memo_sent[agent_key] = sig
             return res
         finally:
             self.active.discard(agent_key)
@@ -581,7 +605,7 @@ class Room:
             prompt = (f"[최근 대화 — 참고용]\n{recent}\n\n" if recent else "") + \
                 f"[{user_name}의 메시지 — 검토 절차 없이 바로 답해 주세요]\n{text}"
         try:
-            res = await self._call(agent_key, prompt, schema=False)
+            res = await self._call(agent_key, prompt, schema=False, memo=not raw)  # /명령 앞에는 붙이지 않음
             if res.ok:
                 await self._post(agent_key, res.text, usage=res.usage)
                 await self._maybe_compact_tip(agent_key, res.usage)
@@ -602,6 +626,38 @@ class Room:
             if leftover:
                 self._start(self._run_task(leftover))
                 await self._state()
+
+    def _similar_tasks(self) -> list[dict]:
+        """이번 과제 지시와 주제가 겹치는 지난 대화(반복 작업 추천용). 다른 대화의 제목 + 사용자 지시 앞부분을 본다."""
+        convs = []
+        for st in self.cfg.settings.log_dir.glob("*.state.json"):
+            cid = st.name[: -len(".state.json")]
+            if cid == self.conv_id:
+                continue
+            try:
+                s = json.loads(st.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            msgs = LogStore(self.cfg.settings.log_dir, cid).load_messages()
+            users = [m.get("text") or "" for m in msgs if m.get("sender") == "user" and not m.get("retracted")][:5]
+            last = msgs[-1]["ts"] if msgs else s.get("created")
+            convs.append({"id": cid, "title": s.get("title") or _title_from(msgs), "updated": last,
+                          "text": " ".join([s.get("title") or "", *users])})
+        return inbox.similar_tasks(" ".join([self.title or "", *self.requirements]), convs)
+
+    async def _final_report(self, outcome: str, detail: str, **flag) -> None:
+        """라운드가 모두 끝난 뒤: 진행 기록(시스템)을 남기고, 실무자가 사용자를 불러 최종 보고한다.
+        10/1 사용자 요청 — 라운드 중에는 셋이 서로 보고하고, 사용자는 끝났을 때만 부른다. 완료 알림은 이 메시지 기준."""
+        await self._post("system", detail)
+        user_name = self.cfg.user.get("name", "사용자")
+        similar = await asyncio.to_thread(self._similar_tasks)
+        res = await self._call(self.cfg.worker, prompts.final_report_prompt(
+            outcome, detail, user_name, similar=similar, memory_dir=self.cfg.settings.memory_dir), schema=False)
+        if res.ok:
+            await self._post(self.cfg.worker, res.text, usage=res.usage, final=True, **flag)
+        else:  # 보고가 실패해도 결과는 알 수 있게
+            await self._post("system", f"{self.cfg.agents[self.cfg.worker].name} 최종 보고 실패: {res.error}\n"
+                                       f"결과: {outcome} (위 진행 기록 참고)", **flag)
 
     async def _run_task(self, instructions: list[str]) -> None:
         cfg = self.cfg
@@ -625,7 +681,8 @@ class Room:
                 new_reqs = self._unseen(cfg.worker)
                 before = await asyncio.to_thread(workspace_snapshot, self.workspace)
                 res = await self._call(cfg.worker, prompts.worker_prompt(
-                    round_no, self.requirements, new_reqs, feedback, user_name, stage=stage), schema=False)
+                    round_no, self.requirements, new_reqs, feedback, user_name, stage=stage,
+                    reviewers=[cfg.agents[k] for k in self.reviewers]), schema=False)
                 if not res.ok:
                     await self._post("system", f"{worker.name} 호출 실패: {res.error}\n과제를 멈춥니다.")
                     return
@@ -690,20 +747,20 @@ class Room:
                         continue  # 계획 승인은 끝이 아니라 초안으로 넘어가는 신호
                     names = ", ".join(a.name for a, _ in feedback)
                     note = f" ({', '.join(failed)} 검토 실패로 제외)" if failed else ""
-                    await self._post("system", f"라운드 {round_no}에서 {names} 모두 APPROVE — 완료했습니다{note}.\n"
-                                               f"작업 폴더: {self.workspace}", done=True)
+                    await self._final_report("모두 승인", f"라운드 {round_no}에서 {names} 모두 APPROVE{note}.\n"
+                                                          f"작업 폴더: {self.workspace}", done=True)
                     carry = self._worker_unseen()
                     return
                 # 남은 필수 지적이 전부 '사용자 결정'이면 실무자에게 돌려도 해결되지 않는다 → 바로 넘김
                 open_reviews = [r for _, r in feedback if not r.approved]
                 if not worker_behind and all(r.user_blockers and not r.worker_blockers for r in open_reviews):
-                    await self._post("system", prompts.user_decision_text(feedback, user_name, worker.name),
-                                     escalation=True)
+                    await self._final_report(f"{user_name} 결정 필요",
+                                             prompts.user_decision_text(feedback, user_name, worker.name), escalation=True)
                     carry = self._worker_unseen()
                     return
                 if round_no == max_rounds:
-                    await self._post("system", prompts.escalation_text(max_rounds, feedback, user_name),
-                                     escalation=True)
+                    await self._final_report(f"{max_rounds}라운드 안에 미합의",
+                                             prompts.escalation_text(max_rounds, feedback, user_name), escalation=True)
                     carry = self._worker_unseen()
                     return
         except (asyncio.CancelledError, CancelledRun):
@@ -735,6 +792,7 @@ class Manager:
         cfg.settings.log_dir.mkdir(parents=True, exist_ok=True)
         self.recent_file = cfg.settings.log_dir / "recent_folders.json"
         self.limits = LimitStore(cfg.settings.log_dir / "usage_limits.json")
+        self.projects = ProjectStore(cfg.settings.log_dir)
         # CLI 가 알려준 슬래시 명령 목록(첫 Claude 호출 때 받아 저장, 자동완성에 씀)
         self.slash_file = cfg.settings.log_dir / "slash_commands.json"
         try:
@@ -745,7 +803,7 @@ class Manager:
     def _room(self, **kw) -> Room:
         return Room(self.cfg, self._broadcast, self.runner_factory, on_change=self.broadcast_list,
                     on_limits=self.update_limits, on_meta=self.update_meta,
-                    slash_commands=lambda: self.slash_commands, **kw)
+                    slash_commands=lambda: self.slash_commands, projects=self.projects, **kw)
 
     async def update_meta(self, info: dict) -> None:
         cmds = info.get("slash_commands")
@@ -770,14 +828,19 @@ class Manager:
         return room
 
     def create(self, workspace: str | None = None, title: str | None = None, safe_mode: bool | None = None,
-               exclude: list[str] | None = None, global_rules: dict | None = None) -> Room:
+               exclude: list[str] | None = None, global_rules: dict | None = None, project: str | None = None) -> Room:
+        proj = self.projects.get(project) if project else None
+        if project and not proj:
+            raise ValueError("없는 프로젝트입니다")
+        if not workspace and proj and proj.get("folder") and Path(proj["folder"]).is_dir():
+            workspace = proj["folder"]  # 프로젝트 안에서 연 새 대화는 프로젝트 기본 폴더에서
         if workspace:
             p = Path(workspace)
             if not p.is_dir():
                 raise ValueError(f"폴더가 없습니다: {workspace}")
             self._remember_folder(str(p))
         room = self._room(workspace=workspace, title=title, safe_mode=safe_mode, exclude=exclude,
-                          global_rules=global_rules)
+                          global_rules=global_rules, project=proj["id"] if proj else None)
         self.rooms[room.conv_id] = room
         return room
 
@@ -800,13 +863,129 @@ class Manager:
                         "created": s.get("created", st.stat().st_mtime),
                         "last": last["text"][:80] if last else "", "running": False,
                         "safe_mode": s.get("safe_mode", False), "rules_off": _rules_off(self.cfg, s),
-                        "archived": bool(s.get("archived", False)),
+                        "archived": bool(s.get("archived", False)), "project": s.get("project"),
                         "approvals": 0})
         out.sort(key=lambda x: x["updated"], reverse=True)
         return out
 
+    # ------------------------------------------------------------ 전체 검색 · 결정 대기함 (v11)
+    def _messages_of(self, conv_id: str) -> list[dict]:
+        if conv_id in self.rooms:
+            return self.rooms[conv_id].messages
+        return LogStore(self.cfg.settings.log_dir, conv_id).load_messages()
+
+    def search(self, q: str, project: str | None = None) -> list[dict]:
+        """모든 대화(보관 포함)의 메시지 내용에서 찾는다. 원본은 logs/*.jsonl(같은 내용인 .md 는 보지 않음).
+        일치한 대화는 개수 제한 없이 모두 돌려준다(대화당 문맥 조각만 최근 3건)."""
+        q = (q or "").strip()
+        if len(q) < 2:
+            return []
+        out = []
+        for c in self.list():
+            if project and c.get("project") != project:
+                continue
+            total, hits = inbox.search_messages(self._messages_of(c["id"]), q)
+            if total:
+                out.append({"id": c["id"], "title": c["title"], "archived": c.get("archived", False),
+                            "total": total, "hits": hits, "latest": hits[0]["ts"] if hits else c["updated"]})
+        out.sort(key=lambda x: x["latest"] or 0, reverse=True)
+        return out
+
+    def inbox(self, project: str | None = None) -> list[dict]:
+        """사용자 판단을 기다리는 대화. 보관한 대화·진행 중인 과제는 빼고, 승인 카드는 살아 있는 것만 센다.
+        (서버를 다시 켜면 예전 승인 카드는 만료된다 — 로그 원본에 pending 으로 남아 있어도 세지 않음)"""
+        user_name = self.cfg.user.get("name", "사용자")
+        items = []
+        for c in self.list():
+            if c.get("archived") or (project and c.get("project") != project):
+                continue
+            room = self.rooms.get(c["id"])
+            msgs = self._messages_of(c["id"])
+            if room:
+                for aid, fut in room.approvals.items():
+                    if fut.done():
+                        continue
+                    card = next((m for m in msgs if m.get("kind") == "approval"
+                                 and (m.get("approval") or {}).get("id") == aid), None)
+                    if card:
+                        items.append({"id": c["id"], "title": c["title"], "reason": "approval", "msg_id": card["id"],
+                                      "ts": card.get("ts"), "sender": card.get("sender"),
+                                      "summary": (card["approval"].get("detail") or "")[:200]})
+            d = inbox.pending_decision(msgs, user_name, running=bool(room and room.running))
+            if d:
+                items.append({"id": c["id"], "title": c["title"], **d})
+        items.sort(key=lambda x: x.get("ts") or 0, reverse=True)
+        return items
+
+    # ------------------------------------------------------------ 프로젝트 (v12)
+    def projects_list(self, convs: list[dict] | None = None) -> list[dict]:
+        counts: dict[str, int] = {}
+        for c in convs if convs is not None else self.list():
+            if c.get("project"):
+                counts[c["project"]] = counts.get(c["project"], 0) + 1
+        return [{**p, "count": counts.get(p["id"], 0)} for p in self.projects.all()]
+
+    def _write_state_field(self, conv_id: str, **fields) -> None:
+        """닫혀 있는 대화의 state.json 에서 지정한 값만 바꾸고 나머지는 그대로 둔다."""
+        path = self.cfg.settings.log_dir / f"{conv_id}.state.json"
+        s = json.loads(path.read_text(encoding="utf-8"))
+        s.update(fields)
+        path.write_text(json.dumps(s, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    async def set_conv_project(self, conv_id: str, pid: str | None, notify: bool = True) -> None:
+        if pid and not self.projects.get(pid):
+            raise ValueError("없는 프로젝트입니다")
+        if conv_id in self.rooms:
+            await self.rooms[conv_id].set_project(pid)
+        elif (self.cfg.settings.log_dir / f"{conv_id}.state.json").exists():
+            self._write_state_field(conv_id, project=pid or None)
+        else:
+            raise KeyError(conv_id)
+        if notify:
+            await self.broadcast_list()
+
+    async def delete_project(self, pid: str) -> int:
+        """프로젝트만 지운다. 속한 대화는 지우지 않고 '기타'로 옮긴다(다음 호출 때 담당자에게 메모 해제를 알림)."""
+        moved = [c["id"] for c in self.list() if c.get("project") == pid]
+        for cid in moved:
+            await self.set_conv_project(cid, None, notify=False)
+        self.projects.delete(pid)
+        await self.broadcast_list()
+        return len(moved)
+
+    def suggest_projects(self) -> list[dict]:
+        """프로젝트에 아직 안 든 대화를 작업 폴더 기준으로 묶은 초안(적용은 사용자가 확인한 뒤)."""
+        convs = [c for c in self.list() if not c.get("project") and not c.get("archived")]
+        return suggest_groups(convs, skip_roots=[str(self.cfg.settings.workspace_root)])
+
+    async def apply_suggestion(self, groups: list[dict]) -> list[dict]:
+        """사용자가 확인한 묶음을 적용. 고치기 전에 해당 대화의 state.json 을 logs/backups 에 복사해 둔다."""
+        import shutil
+        log_dir = self.cfg.settings.log_dir
+        backup = log_dir / "backups"
+        backup.mkdir(exist_ok=True)
+        created = []
+        for g in groups:
+            ids = [str(x) for x in g.get("conv_ids") or []]
+            if not ids:
+                continue
+            for cid in ids:
+                src = log_dir / f"{cid}.state.json"
+                if src.exists():
+                    stamp = datetime.fromtimestamp(src.stat().st_mtime).strftime("%Y%m%d_%H%M%S")
+                    dst = backup / f"backup_{stamp}_프로젝트적용_{cid}.state.json"
+                    if not dst.exists():
+                        shutil.copy2(src, dst)
+            p = self.projects.create(g.get("name") or "새 프로젝트", g.get("folder") or "", g.get("memo") or "")
+            for cid in ids:
+                await self.set_conv_project(cid, p["id"], notify=False)
+            created.append(p)
+        await self.broadcast_list()
+        return created
+
     async def broadcast_list(self) -> None:
-        await self._broadcast({"type": "conversations", "conversations": self.list()})
+        convs = self.list()
+        await self._broadcast({"type": "conversations", "conversations": convs, "projects": self.projects_list(convs)})
 
     def reload(self, cfg: AppConfig) -> None:
         self.cfg = cfg

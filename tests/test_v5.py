@@ -42,7 +42,7 @@ class ParallelReviewTests(Base):
         texts = [m["text"] for m in room.messages if m["sender"] == "system"]
         self.assertTrue(any("Clara 검토 실패" in t and "나머지 감독" in t for t in texts))
         self.assertTrue(room.messages[-1].get("done"))
-        self.assertIn("Clara 검토 실패로 제외", room.messages[-1]["text"])
+        self.assertIn("Clara 검토 실패로 제외", room.messages[-2]["text"])
 
     async def test_all_reviewers_fail_stops(self):
         FakeRunner.scripts = {"jake": ["v1"], "clara": [None], "quinn": [None]}

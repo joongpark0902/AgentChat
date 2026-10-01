@@ -24,9 +24,8 @@ class NeedsUserFlow(Base):
         room = self.room()
         await self.run_to_end(room, "표 작성")
         self.assertEqual(len(self.called("jake")), 1)  # 실무자에게 다시 돌리지 않음
-        last = room.messages[-1]
-        self.assertTrue(last.get("escalation"))
-        self.assertIn("숨긴 열을 뺄지", last["text"])
+        self.assertTrue(room.messages[-1].get("escalation"))
+        self.assertIn("숨긴 열을 뺄지", room.messages[-2]["text"])
         self.assertFalse(room.running)
 
     async def test_mixed_blockers_still_go_to_worker(self):

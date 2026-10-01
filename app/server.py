@@ -402,6 +402,65 @@ def create_app(manager_factory=None, transcriber=None, private_dir: Path | None 
     async def list_conversations():
         return {"conversations": mgr().list(), "recent_folders": mgr().recent_folders()}
 
+    @app.get("/api/search")
+    async def search_messages(q: str = "", project: str = ""):
+        return {"q": q, "results": await asyncio.to_thread(mgr().search, q, project or None)}
+
+    @app.get("/api/inbox")
+    async def decision_inbox(project: str = ""):
+        return {"items": await asyncio.to_thread(mgr().inbox, project or None)}
+
+    # ------------------------------------------------------------ 프로젝트 (v12)
+    @app.get("/api/projects")
+    async def list_projects():
+        return {"projects": await asyncio.to_thread(mgr().projects_list)}
+
+    @app.post("/api/projects")
+    async def create_project(body: dict = Body(...)):
+        try:
+            p = mgr().projects.create(body.get("name", ""), body.get("folder", ""), body.get("memo", ""))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        for cid in body.get("conv_ids") or []:
+            await mgr().set_conv_project(str(cid), p["id"], notify=False)
+        await mgr().broadcast_list()
+        return {"project": p}
+
+    @app.put("/api/projects/{pid}")
+    async def update_project(pid: str, body: dict = Body(...)):
+        try:
+            p = mgr().projects.update(pid, body)
+        except KeyError:
+            raise HTTPException(404, "프로젝트가 없습니다")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        await mgr().broadcast_list()
+        return {"project": p}
+
+    @app.delete("/api/projects/{pid}")
+    async def delete_project(pid: str):
+        if not mgr().projects.get(pid):
+            raise HTTPException(404, "프로젝트가 없습니다")
+        return {"moved": await mgr().delete_project(pid)}
+
+    @app.get("/api/projects/suggest")
+    async def suggest_projects():
+        return {"groups": await asyncio.to_thread(mgr().suggest_projects)}
+
+    @app.post("/api/projects/apply-suggestion")
+    async def apply_project_suggestion(body: dict = Body(...)):
+        return {"created": await mgr().apply_suggestion(body.get("groups") or [])}
+
+    @app.post("/api/conv/{conv_id}/project")
+    async def move_conversation(conv_id: str, body: dict = Body(default={})):
+        try:
+            await mgr().set_conv_project(conv_id, body.get("project") or None)
+        except KeyError:
+            raise HTTPException(404, "대화를 찾을 수 없습니다")
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        return {"ok": True}
+
     @app.post("/api/conversations")
     async def create_conversation(body: dict = Body(default={})):
         gr = body.get("global_rules")  # True/False(전원 일괄) 또는 {담당자: True/False}
@@ -409,7 +468,8 @@ def create_app(manager_factory=None, transcriber=None, private_dir: Path | None 
             room = mgr().create(workspace=body.get("workspace") or None, title=body.get("title") or None,
                                 safe_mode=None if gr is None or isinstance(gr, dict) else not bool(gr),
                                 global_rules=gr if isinstance(gr, dict) else None,
-                                exclude=[str(x) for x in body.get("exclude") or []])
+                                exclude=[str(x) for x in body.get("exclude") or []],
+                                project=body.get("project") or None)
         except ValueError as e:
             raise HTTPException(400, str(e))
         await mgr().broadcast_list()
@@ -522,7 +582,9 @@ def create_app(manager_factory=None, transcriber=None, private_dir: Path | None 
             return
         hub.clients.add(ws)
         m = mgr()
-        await ws.send_text(json.dumps({"type": "init", "config": m.cfg.public(), "conversations": m.list(),
+        convs = m.list()
+        await ws.send_text(json.dumps({"type": "init", "config": m.cfg.public(), "conversations": convs,
+                                       "projects": m.projects_list(convs),
                                        "recent_folders": m.recent_folders(), "limits": m.limits.data,
                                        "slash_commands": m.slash_commands,
                                        "client": {"local": auth.is_local(ws.scope)}},
