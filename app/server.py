@@ -16,8 +16,10 @@ from fastapi.staticfiles import StaticFiles
 
 from urllib.parse import quote
 
+from . import mail
 from .auth import COOKIE, MAX_FAILS, SESSION_DAYS, Auth
 from .config import CONFIG_DIR, ROOT, editable_config, find_codex_exe, load_config, save_editable_config
+from .digest import MailDigest
 from .orchestrator import Manager, is_temp_file
 from .preview import preview
 from .push import Notifier, Push
@@ -149,7 +151,12 @@ def create_app(manager_factory=None, transcriber=None, private_dir: Path | None 
         auth.remote_port = cfg.settings.remote_port
         push.subject = cfg.settings.push_subject or push.subject
         state["manager"] = manager_factory(cfg, hub.broadcast) if manager_factory else Manager(cfg, hub.broadcast)
+        state["digest"] = MailDigest(mgr, notifier)   # 매일 아침 메일 요약(설정에서 켰을 때만 돈다)
+        ticking = asyncio.create_task(state["digest"].loop())
         yield
+        ticking.cancel()
+        for t in list(state["digest"].bg):
+            t.cancel()
         await state["manager"].stop_all()
 
     app = FastAPI(lifespan=lifespan)
@@ -570,6 +577,25 @@ def create_app(manager_factory=None, transcriber=None, private_dir: Path | None 
         dst.write_bytes(data)
         return {"path": dst.relative_to(base).as_posix(), "size": len(data)}
 
+    # ------------------------------------------------------------ 메일(Outlook) — PC 화면 전용, 목록·검색만
+    @app.get("/api/mail")
+    async def mail_list(request: Request, q: str = "", days: int = 7, body: bool = False):
+        require_local(request)   # 폰 화면으로는 메일 목록을 내보내지 않는다
+        return await asyncio.to_thread(mail.list_mail, q.strip()[:200], max(0, min(days, 3650)), body)
+
+    @app.get("/api/mail/body")
+    async def mail_body(request: Request, id: str = ""):
+        require_local(request)
+        if not re.fullmatch(r"[0-9A-Fa-f]{8,600}", id):
+            raise HTTPException(400, "메일 ID 가 올바르지 않습니다")
+        return await asyncio.to_thread(mail.read_mail, id)
+
+    @app.post("/api/mail/digest")
+    async def mail_digest_now(request: Request):
+        """'새 메일 요약' 버튼: 아직 요약하지 않은 받은 메일을 지금 요약한다(예약과 같은 일을 손으로 한 번)."""
+        require_local(request)
+        return await state["digest"].start_manual()
+
     # ------------------------------------------------------------ 실시간
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket):
@@ -587,7 +613,8 @@ def create_app(manager_factory=None, transcriber=None, private_dir: Path | None 
                                        "projects": m.projects_list(convs),
                                        "recent_folders": m.recent_folders(), "limits": m.limits.data,
                                        "slash_commands": m.slash_commands,
-                                       "client": {"local": auth.is_local(ws.scope)}},
+                                       "client": {"local": auth.is_local(ws.scope)},
+                                       "features": {"mail": auth.is_local(ws.scope) and mail.available()}},
                                       ensure_ascii=False))
         try:
             while True:
@@ -617,6 +644,7 @@ def create_app(manager_factory=None, transcriber=None, private_dir: Path | None 
             hub.presence.pop(ws, None)
 
     app.state.auth, app.state.push, app.state.notifier, app.state.hub = auth, push, notifier, hub
+    app.state.digest = lambda: state.get("digest")
     return app
 
 

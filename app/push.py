@@ -124,6 +124,7 @@ class Notifier:
         self.last: dict[str, dict] = {}
         self.sent: list[dict] = []          # 테스트·진단용 최근 알림
         self.tasks: set[asyncio.Task] = set()
+        self.muted: set[str] = set()        # '끝났습니다' 알림을 자동으로 보내지 않을 대화(메일 요약: 끝에 건수만 직접 알림)
 
     def _agent_name(self, key: str) -> str:
         a = self.cfg().agents.get(key)
@@ -155,10 +156,16 @@ class Notifier:
             was, now = self.running.get(conv, False), bool(payload.get("running"))
             self.running[conv] = now
             if was and not now:
+                if conv in self.muted:
+                    return
                 last = self.last.get(conv)
                 if last and last.get("sender") == "system" and str(last.get("text", "")).startswith("사용자 요청으로 중단"):
                     return  # 직접 멈춘 것은 알리지 않음
                 await self._send(conv, self.text_for(last))
+
+    async def announce(self, conv: str, body: str) -> None:
+        """정해 준 글로 알림 한 번(메일 요약: '메일 요약 N통'처럼 건수만 — 메일 제목·내용은 싣지 않는다)."""
+        await self._send(conv, body)
 
     async def _send(self, conv: str, body: str) -> None:
         """보내기는 따로 돌린다(푸시 서버 응답을 기다리느라 채팅 방송이 늦어지지 않게)."""

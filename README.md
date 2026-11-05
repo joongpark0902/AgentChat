@@ -193,6 +193,8 @@ AgentChat\
   app\verdict.py  app\prompts.py  app\logstore.py
   tools\gen_avatars.py Codex 이미지 생성으로 프로필 사진 만들기
   tools\dump_office.py 결과물(pptx·xlsx·docx)을 글자로 풀어 보여주기(감독 검수용, 읽기 전용)
+  tools\outlook_tool.py 클래식 Outlook 편지함 읽기(목록·검색·본문·첨부 저장) + 초안 저장(보내기·지우기·옮기기 없음)
+  app\mail.py  app\digest.py  ✉ 메일 창(목록·본문 보기, PC 전용) / 매일 아침 메일 요약(settings.yaml 의 mail_digest, 기본 꺼짐)
   web\                 화면(index.html, style.css, app.js) · login.html · sw.js · manifest.webmanifest · icons\
   private\             비밀번호 해시·세션 키·알림 키/구독 (git·백업 제외)
   config\avatars\      프로필 사진
