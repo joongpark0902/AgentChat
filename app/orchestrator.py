@@ -95,9 +95,21 @@ def _rules_off(cfg: AppConfig, state: dict, safe_mode: bool | None = None,
     return [k for k in keys if not cfg.settings.rules_on(k)]
 
 
+MAIL_BLOCK = "[첨부 메일 —"   # 화면이 지시문 끝에 붙이는 Outlook 메일 블록의 머리말(web/app.js 의 MAIL_HEAD)
+
+
+def _title_text(text: str) -> str:
+    """대화 제목으로 쓸 글: 메일 블록은 빼고, 글 없이 메일만 붙인 지시면 첫 메일의 제목."""
+    head = text.split(MAIL_BLOCK)[0].strip()
+    if head or MAIL_BLOCK not in text:
+        return head
+    m = re.search(r"^- [^|]* \| .*? \| (.*) \| ID=[0-9A-Fa-f]+$", text, re.M)
+    return m.group(1) if m else text
+
+
 def _title_from(messages: list[dict]) -> str:
     first = next((m for m in messages if m.get("sender") == "user"), None)
-    return (first["text"] or (first.get("attachments") or [""])[0])[:40] if first else ""
+    return (_title_text(first["text"]) or (first.get("attachments") or [""])[0])[:40] if first else ""
 
 
 class Room:
@@ -122,6 +134,7 @@ class Room:
         self.on_change = on_change
         self.runner_factory = runner_factory
         self.task: asyncio.Task | None = None
+        self.auto_deny = False                 # 사람 없이 도는 대화(메일 요약): 승인이 필요한 명령은 기다리지 않고 거부
         self._busy = False  # 과제 진행 중 여부(과제 마지막 상태 알림 시점에 task.done() 이 아직 False 라 따로 둠)
         self.pending: list[str] = []
         self.pending_ids: list[str] = []       # pending 과 같은 순서의 사용자 메시지 id(전달 전이라 수정·취소 가능)
@@ -289,6 +302,10 @@ class Room:
             await self.on_change()
         return msg
 
+    async def note(self, text: str) -> dict:
+        """시스템 안내 글 한 줄 남기기(메일 요약의 결과·실패 안내처럼 담당자 답이 아닌 글)."""
+        return await self._post("system", text)
+
     async def _update(self, msg: dict, **fields) -> None:
         msg.update(fields)
         self.store.append_update(msg["id"], fields)
@@ -330,7 +347,7 @@ class Room:
             return
         self.loop = asyncio.get_running_loop()
         if not self.title:
-            self.title = (text or attachments[0])[:40]
+            self.title = (_title_text(text) or attachments[0])[:40]
             self._save_state()
         if self.archived:
             await self.set_archived(False)
@@ -464,10 +481,13 @@ class Room:
         return approve
 
     async def _ask_approval(self, agent_key: str, tool: str, inp: dict, desc: str) -> bool:
+        detail = inp.get("command") or inp.get("file_path") or json.dumps(inp, ensure_ascii=False)[:800]
+        if self.auto_deny:  # 허락해 줄 사람이 없는 자동 실행 → 멈춰 기다리지 않고 거부하고 기록만 남긴다
+            await self._post("system", f"자동 실행 중이라 승인이 필요한 명령을 거부했습니다: {tool} — {str(detail)[:300]}")
+            return False
         aid = uuid.uuid4().hex[:10]
         fut = asyncio.get_running_loop().create_future()
         self.approvals[aid] = fut
-        detail = inp.get("command") or inp.get("file_path") or json.dumps(inp, ensure_ascii=False)[:800]
         name = self.cfg.agents[agent_key].name
         msg = await self._post(agent_key, f"{name}가 실행 허락을 요청합니다: {tool}", kind="approval",
                                approval={"id": aid, "tool": tool, "detail": detail, "description": desc,
@@ -550,6 +570,11 @@ class Room:
                 limits(res.limits)
             if res.ok and sig is not None:
                 self.memo_sent[agent_key] = sig
+            if res.ok and res.restarted:
+                if not prefix:  # 새 세션은 예전에 보낸 프로젝트 메모를 모름 → 다음 호출에 다시 보냄
+                    self.memo_sent.pop(agent_key, None)
+                await self._post("system", f"{self.cfg.agents[agent_key].name}의 이전 세션을 이어받지 못해 새 세션으로 다시 시작했습니다. "
+                                           f"앞 대화 기억은 이어지지 않습니다.")
             return res
         finally:
             self.active.discard(agent_key)

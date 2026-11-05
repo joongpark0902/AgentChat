@@ -11,3 +11,16 @@ config/backups/
 .claude/
 config/agents.yaml
 config/settings.yaml
+
+# 사장님 PC 전용 프로필 사진(실제 인물 기반 → 공개 저장소에 올리지 않음)
+config/avatars/local_*
+
+# Outlook 에서 내려받은 메일 첨부, 채팅에 올린 첨부(고객 자료)
+_메일/
+_첨부/
+
+# 작업·검증용 임시 폴더(다른 대화 작업물 포함, 올리지 않음)
+_qa/
+_qa_*/
+_화면확인_*/
+_참고_*/

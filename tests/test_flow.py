@@ -45,6 +45,8 @@ class FakeRunner(BaseRunner):
             if self._cancelled:
                 raise CancelledRun()
             return RunResult(ok=True, text=f"승인 결과: {allowed}", session_id=self.session_id)
+        if isinstance(item, tuple) and item[0] == "RESTARTED":  # 이어받기 실패 → 새 세션으로 받은 답
+            return RunResult(ok=True, text=item[1], session_id=self.session_id, restarted=True)
         if isinstance(item, dict):
             return RunResult(ok=True, text=json.dumps(item, ensure_ascii=False), structured=item, session_id=self.session_id)
         if item is None:

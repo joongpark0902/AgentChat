@@ -27,6 +27,7 @@ class AgentConfig:
     color: str = "#8E8E93"
     checklist: list[str] = field(default_factory=list)
     not_my_job: str = ""
+    permission_mode: str | None = None  # readonly 감독 전용: "auto" 면 python 외 명령도 분류기가 판단(삭제·이동·push 는 승인 카드)
 
     user_name: str = "사용자"  # load_config 에서 agents.yaml 의 user.name 으로 채움
     memory_dir: str = ""       # load_config 에서 settings 의 memory_dir 로 채움
@@ -36,6 +37,7 @@ class AgentConfig:
         text = self.prompt
         for k, v in {"{name}": self.name, "{workspace}": workspace, "{user}": self.user_name,
                      "{memory_dir}": self.memory_dir, "{dump_tool}": str(ROOT / "tools" / "dump_office.py"),
+                     "{outlook_tool}": str(ROOT / "tools" / "outlook_tool.py"),
                      "{checklist}": checklist, "{not_my_job}": self.not_my_job}.items():
             text = text.replace(k, v)
         return text.strip()
@@ -70,6 +72,7 @@ class Settings:
     push_subject: str = ""             # 웹 푸시 VAPID 연락처(비우면 기본값)
     claude_rules: dict = None          # 담당자별 전역 규칙 {key: True/False}. 없는 담당자는 safe_mode 를 따름
     flow: str = "classic"              # classic: 라운드마다 완성본 / staged: 1 방향(계획) → 2 초안 → 3 마무리
+    mail_digest: dict = None           # 메일 요약 예약 {enabled, times ["HH:MM", ...], weekdays_only, notify_empty}
 
     def rules_on(self, key: str) -> bool:
         return bool((self.claude_rules or {}).get(key, not self.claude_safe_mode))
@@ -158,9 +161,12 @@ def load_config(config_dir: Path | None = None) -> AppConfig:
             access=v.get("access", "readonly"), prompt=v["prompt"], model=v.get("model"),
             effort=v.get("effort"), avatar=v.get("avatar"), color=v.get("color", "#8E8E93"),
             checklist=v.get("checklist") or [], not_my_job=v.get("not_my_job", ""),
+            permission_mode=v.get("permission_mode") or None,
             user_name=user.get("name", "사용자"))
         if agents[key].engine not in ("claude", "codex"):
             raise ValueError(f"{key}: engine 은 claude 또는 codex 여야 합니다")
+        if agents[key].permission_mode not in (None, "auto"):
+            raise ValueError(f"{key}: permission_mode 는 비우거나 auto 여야 합니다")
 
     for k in [a["worker"], *a["reviewers"]]:
         if k not in agents:
@@ -186,12 +192,31 @@ def load_config(config_dir: Path | None = None) -> AppConfig:
         readonly_mcp_allow=list(claude.get("readonly_mcp_allow") or DEFAULT_READONLY_MCP),
         remote_port=int(s.get("remote_port", 8790)), push_subject=str(s.get("push_subject") or ""),
         claude_rules={str(k): bool(v) for k, v in (claude.get("global_rules") or {}).items()},
-        flow="staged" if s.get("flow") == "staged" else "classic")
+        flow="staged" if s.get("flow") == "staged" else "classic",
+        mail_digest=digest_settings(s.get("mail_digest")))
 
     for ag in agents.values():
         ag.memory_dir = settings.memory_dir
     return AppConfig(room_name=a.get("room_name", "작업방"), user=user,
                      worker=a["worker"], reviewers=list(a["reviewers"]), agents=agents, settings=settings)
+
+
+def digest_settings(d) -> dict:
+    """settings.yaml 의 mail_digest. 적지 않으면 꺼져 있다. times 에 하루 여러 시각을 적을 수 있고, 쓸 만한 시각이 없으면 10:00 으로 본다."""
+    d = d if isinstance(d, dict) else {}
+
+    def hhmm(x) -> str | None:
+        if isinstance(x, int) and not isinstance(x, bool):   # 따옴표 없이 14:00 이라고 적으면 YAML 이 840(분)으로 읽는다
+            x = f"{x // 60}:{x % 60:02d}"
+        parts = str(x).strip().split(":")
+        if len(parts) == 2 and all(p.isdigit() for p in parts) and int(parts[0]) < 24 and int(parts[1]) < 60:
+            return f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+        return None
+
+    raw = d["times"] if isinstance(d.get("times"), (list, tuple)) else [d.get("time", "10:00")]   # time: 예전 방식(하루 한 번)
+    times = sorted({t for t in map(hhmm, raw) if t}) or ["10:00"]
+    return {"enabled": bool(d.get("enabled", False)), "times": times,
+            "weekdays_only": bool(d.get("weekdays_only", False)), "notify_empty": bool(d.get("notify_empty", True))}
 
 
 # ---------------------------------------------------------------- 화면(설정 창)에서 편집

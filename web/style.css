@@ -676,4 +676,47 @@ details.reqs > summary { cursor: pointer; font-size: 12.5px; color: var(--sub); 
 .sug-head input[type=text], .sug-head input:not([type]) { flex: 1; }
 .sug-conv { display: block; font-size: 13px; padding: 3px 0 3px 4px; cursor: pointer; }
 .scope-toggle { display: block; font-size: 13px; color: var(--sub); margin-bottom: 10px; cursor: pointer; }
+/* 10/1: 결정 대기함은 본문(.sheet-body, 가로 flex)에 바로 붙여 체크박스가 한 글자씩 세로로 꺾이고 항목이 옆으로 늘어섰음 → 세로로 쌓고 스크롤 */
+.sheet.inbox-modal .sheet-body { flex-direction: column; overflow-y: auto; padding: 14px 18px; }
+.sheet.inbox-modal .scope-toggle, .sheet.inbox-modal .inbox-item { flex: 0 0 auto; }  /* 세로 배치에서 줄어들지 않게(긴 이름은 일반 글처럼 줄바꿈) */
 .hit-head .proj-link { margin-left: 8px; }
+
+/* 메일에서 고르기(✉) — PC 화면 전용 */
+.sheet.mail-sheet { width: min(900px, 100%); height: min(720px, 100%); }
+.mail-sheet .sheet-body { flex-direction: column; }
+.mail-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.mail-bar { display: flex; gap: 8px; align-items: center; padding: 12px 18px 8px; }
+.mail-bar input[type=text], .mail-bar select { border: 1px solid var(--line); border-radius: 9px; padding: 7px 10px; font: inherit; font-size: 13.5px; background: var(--field); color: var(--text); outline: none; }
+.mail-bar input[type=text] { flex: 1; min-width: 0; }
+.mail-bar input[type=text]:focus, .mail-bar select:focus { border-color: rgba(10, 132, 255, 0.55); }
+.mail-opt { display: inline-flex; gap: 5px; align-items: center; font-size: 12.5px; color: var(--sub); white-space: nowrap; cursor: pointer; }
+.mail-info { padding: 0 18px 8px; border-bottom: 1px solid var(--line); }
+.mail-line { font-size: 11.5px; color: var(--sub); line-height: 1.55; }
+.mail-line.strong { color: var(--text); font-size: 12.5px; font-weight: 600; margin-top: 2px; }
+.mail-line.warn { color: var(--revise); }
+.mail-list { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 8px 8px; }
+.mail-row { display: grid; grid-template-columns: 112px 160px 1fr auto 40px; column-gap: 10px; align-items: baseline; width: 100%; text-align: left; border: 0; background: none; color: var(--text); font: inherit; font-size: 13px; padding: 7px 10px; border-radius: 10px; cursor: pointer; }
+.mail-row:hover { background: var(--hover); }
+.mail-row.picked { background: rgba(10, 132, 255, 0.1); }
+.mail-row .m-time { color: var(--sub); font-size: 12px; font-variant-numeric: tabular-nums; }
+.mail-row .m-from, .mail-row .m-subj, .mail-row .m-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mail-row .m-subj { font-weight: 500; }
+.mail-row .m-meta { grid-column: 2 / 4; font-size: 11.5px; color: var(--faint); }
+.mail-row .m-meta i { font-style: normal; color: var(--sub); background: var(--code-bg); border-radius: 5px; padding: 0 5px; margin-right: 5px; }
+.mail-row .m-meta i.warn { color: var(--revise); background: var(--revise-bg); }
+.mail-row .m-pick { grid-column: 5; grid-row: 1 / 3; align-self: center; text-align: right; color: var(--sel); font-size: 12px; font-weight: 600; }
+.mail-sep { font-size: 11.5px; color: var(--revise); padding: 10px 10px 4px; border-top: 1px solid var(--line); margin-top: 6px; }
+.mail-row { box-sizing: border-box; outline: none; }
+.mail-row:focus-visible { box-shadow: inset 0 0 0 2px rgba(10, 132, 255, 0.45); }
+.mail-row .m-view { grid-column: 4; grid-row: 1 / 3; align-self: center; border: 1px solid var(--line); background: var(--bg); color: var(--sub); border-radius: 8px; padding: 3px 9px; font: inherit; font-size: 12px; cursor: pointer; }
+.mail-row .m-view:hover { color: var(--sel); border-color: rgba(10, 132, 255, 0.55); }
+/* 본문 보기: 목록 자리에 한 통을 펼친다 */
+.mail-view { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 18px 14px; }
+.mv-top { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.mv-gap { flex: 1; }
+.mv-subj { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 8px; overflow-wrap: anywhere; }
+.mv-head { font-size: 12.5px; color: var(--sub); line-height: 1.6; border-bottom: 1px solid var(--line); padding-bottom: 8px; overflow-wrap: anywhere; }
+.mv-head b { display: inline-block; width: 56px; font-weight: 600; color: var(--text); }
+.mv-head.warn { color: var(--revise); border-bottom: 0; }
+.mv-note { font-size: 11.5px; color: var(--faint); margin: 8px 0; }
+.mv-body { font-family: var(--font); font-size: 13.5px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; color: var(--text); }

@@ -31,6 +31,19 @@ class Memo(Base):
         self.store.update(self.pa["id"], {"memo": "기준일 2025-12-31, 단위 천원"})
         self.assertIn("단위 천원", await self.ask(room))              # 바뀌면 다시
 
+    async def test_restarted_session_gets_memo_again(self):
+        # 10/8: 이전 세션을 이어받지 못해 새 세션으로 답한 경우 — 안내를 남기고, 새 세션이 모르는 메모는 다음 호출에 다시 보냄
+        FakeRunner.scripts = {"jake": [], "clara": [], "quinn": []}
+        room = self.room(project=self.pa["id"])
+        await self.ask(room)
+        FakeRunner.scripts["jake"] = [("RESTARTED", "새 세션 답")]
+        await self.run_to_end(room, "둘째", mode="quick")
+        self.assertNotIn(MEMO_HEAD, self.called("jake")[-1])
+        notes = [m["text"] for m in room.messages if m["sender"] == "system" and "새 세션으로 다시 시작" in m["text"]]
+        self.assertEqual(len(notes), 1)
+        self.assertTrue((await self.ask(room)).startswith(MEMO_HEAD + " A사 실사]"))
+        self.assertNotIn(MEMO_HEAD, await self.ask(room))
+
     async def test_move_to_other_project_with_same_text_resends(self):
         FakeRunner.scripts = {"jake": [], "clara": [], "quinn": []}
         pb = self.store.create("B사 실사", memo=self.pa["memo"])     # 문구까지 같은 다른 프로젝트
@@ -167,6 +180,65 @@ class ManagerProjects(Base):
         self.assertEqual([i["id"] for i in m.inbox(project=p["id"])], [room.conv_id])
         with self.assertRaises(ValueError):
             m.create(project="없음")
+
+
+class ReviewRisks(Base):
+    """프로젝트 기능 검토(10/1) 때 스스로 짚은 위험 지점."""
+
+    def write_state(self, cid, ws):
+        logs = self.cfg.settings.log_dir
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / f"{cid}.state.json").write_text(json.dumps({"conv_id": cid, "title": cid, "workspace": str(ws)},
+                                                           ensure_ascii=False), encoding="utf-8")
+
+    def read_state(self, cid):
+        return json.loads((self.cfg.settings.log_dir / f"{cid}.state.json").read_text(encoding="utf-8"))
+
+    async def test_apply_while_room_open_is_not_reverted(self):
+        ws = self.tmp / "FDD" / "예시사"
+        ws.mkdir(parents=True)
+        self.write_state("c1", ws)
+        self.write_state("c2", ws)
+        m = Manager(self.cfg, self.bc, runner_factory=FakeRunner)
+        room = m.get("c1")                                            # 한 대화는 열려 있는 상태
+        g = m.suggest_projects()[0]
+        pid = (await m.apply_suggestion([{"name": g["name"], "folder": g["folder"],
+                                          "conv_ids": [c["id"] for c in g["convs"]]}]))[0]["id"]
+        self.assertEqual(room.project, pid)
+        room._save_state()                                            # 열린 대화가 나중에 상태를 저장해도
+        self.assertEqual(self.read_state("c1")["project"], pid)       # 되돌아가지 않음
+        self.assertEqual(self.read_state("c2")["project"], pid)
+        self.assertEqual(m.get("c2").project, pid)                    # 닫혀 있던 대화를 나중에 열어도 그대로
+
+    async def test_memo_with_braces_is_sent_verbatim(self):
+        FakeRunner.scripts = {"jake": ["답"], "clara": [], "quinn": []}
+        store = ProjectStore(self.cfg.settings.log_dir)
+        p = store.create("A사", memo="표기 {단위} 원, 코드 {0} %s \\n 그대로")
+        room = self.room(project=p["id"])
+        await self.run_to_end(room, "질문", mode="quick")
+        self.assertIn("표기 {단위} 원, 코드 {0} %s \\n 그대로", self.called("jake")[0])
+
+    async def test_missing_project_folder_falls_back_to_new_folder(self):
+        m = Manager(self.cfg, self.bc, runner_factory=FakeRunner)
+        p = m.projects.create("A사", folder=str(self.tmp / "지워진폴더"))
+        room = m.create(project=p["id"])
+        self.assertEqual(room.project, p["id"])
+        self.assertTrue(room.workspace.is_dir())
+        self.assertEqual(room.workspace.parent, self.cfg.settings.workspace_root)  # 앱이 새 폴더를 만듦
+
+    async def test_delete_sends_release_once_to_each_agent(self):
+        FakeRunner.scripts = {"jake": ["v1", "v2"], "clara": [review("APPROVE")] * 2, "quinn": [review("APPROVE")] * 2}
+        m = Manager(self.cfg, self.bc, runner_factory=FakeRunner)
+        p = m.projects.create("A사", memo="단위 원")
+        room = m.create(project=p["id"])
+        await self.run_to_end(room, "표 작성")
+        await m.delete_project(p["id"])
+        await self.run_to_end(room, "표 수정")
+        for k in ("jake", "clara", "quinn"):
+            prompts = self.called(k)
+            self.assertTrue(prompts[0].startswith("[프로젝트 메모 —"), k)
+            self.assertTrue(prompts[1].startswith("[프로젝트 메모 해제]"), k)
+            self.assertEqual(sum(x.count("[프로젝트 메모 해제]") for x in prompts), 1, k)
 
 
 class Api(ServerTests):

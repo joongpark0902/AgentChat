@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Callable
@@ -69,6 +70,8 @@ class RunResult:
     limits: dict | None = None   # 구독 한도 사용률 {five_hour:{pct,resets_at}, seven_day:{...}}
     tool_calls: int | None = None  # 이번 답변에서 쓴 도구 횟수(파일 열기·실행·조회). None = 알 수 없음
     context: dict | None = None  # 세션 컨텍스트 크기 {used, window, updated}
+    timed_out: bool = False      # 제한 시간 초과로 끊김
+    restarted: bool = False      # 이전 세션을 이어받지 못해 새 세션으로 다시 시작해 받은 답
 
 
 class CancelledRun(Exception):
@@ -186,21 +189,40 @@ class BaseRunner:
         def ts(fn):
             return (lambda *a: loop.call_soon_threadsafe(fn, *a)) if fn else (lambda *a: None)
 
-        result = await asyncio.to_thread(self._run_blocking, prompt, workspace, schema_path,
+        result = await asyncio.to_thread(self._run_with_fresh_retry, prompt, workspace, schema_path,
                                          ts(activity), approve, ts(on_limits), ts(on_meta))
         if self._cancelled:
             raise CancelledRun()
         return result
 
+    fresh_retry_on_resume_failure = False  # 이어받기가 바로 실패하면 새 세션으로 한 번 더(Codex 만 켬)
+
+    def _run_with_fresh_retry(self, prompt: str, workspace: str, schema_path: str | None, *cb) -> RunResult:
+        """이전 세션 이어받기가 아무 일도 못 하고 실패하면(예: Codex 로그인 계정을 바꾼 뒤) 새 세션으로 한 번만 다시 부른다.
+        새 세션도 실패하면(한도·네트워크 등) 옛 세션 정보를 그대로 되돌려 둔다."""
+        resumed = self.started and bool(self.session_id)
+        saved = self.state()
+        result = self._run_blocking(prompt, workspace, schema_path, *cb)
+        if (not self.fresh_retry_on_resume_failure or not resumed or result.ok or result.timed_out
+                or self._cancelled or result.tool_calls):
+            return result
+        self.restore({"session_id": None, "started": False, "usage_snapshot": None, "context": None})
+        retry = self._run_blocking(prompt, workspace, schema_path, *cb)
+        if retry.ok:
+            retry.restarted = True
+            return retry
+        self.restore(saved)
+        return result
+
     def _run_blocking(self, prompt: str, workspace: str, schema_path: str | None,
                       activity: ActivityFn, approve: ApproveFn | None,
                       on_limits: LimitsFn = lambda d: None, on_meta: MetaFn = lambda d: None) -> RunResult:
-        self._was_started = self.started
         self._tool_calls = 0
         try:
             cmd = self.build_command(workspace, schema_path)
         except (OSError, ValueError) as e:  # 예: Codex CLI 가 없는 PC → 과제를 멈추지 않고 그 담당자만 실패로
             return RunResult(ok=False, text="", error=str(e))
+        self._was_started = self.started  # build_command 가 끊긴 세션을 이어받으면 True 로 바뀜
         stdin_text = self.build_stdin(prompt, workspace)
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         try:
@@ -216,21 +238,16 @@ class BaseRunner:
             timed_out.set()
             kill_tree(proc)
 
-        timer = threading.Timer(self.settings.call_timeout_sec, on_timeout)
+        timer = CallTimer(self.settings.call_timeout_sec, on_timeout)
         timer.start()
         stderr_chunks: list[str] = []
         t_err = threading.Thread(target=lambda: stderr_chunks.append(proc.stderr.read()), daemon=True)
         t_err.start()
-        ctx = LineContext(proc, activity, approve, on_limits, on_meta)
+        ctx = LineContext(proc, activity, timer.paused(approve) if approve else None, on_limits, on_meta)
         poller = threading.Thread(target=self.poll_progress, args=(proc, ctx), daemon=True)
         poller.start()
-        try:
-            proc.stdin.write(stdin_text)
-            proc.stdin.flush()
-            if not self.keeps_stdin_open:
-                proc.stdin.close()  # codex exec 는 stdin 이 열려 있으면 추가 입력을 기다림(실측)
-        except OSError:
-            pass
+        self._writer = threading.Thread(target=self._write_input, args=(proc, ctx, stdin_text), daemon=True)
+        self._writer.start()
         lines = []
         for line in proc.stdout:
             lines.append(line)
@@ -238,7 +255,9 @@ class BaseRunner:
                 self.on_line(line, ctx)
             except Exception:  # 진행 표시 실패가 본 작업을 막지 않게
                 pass
-        ctx.close_stdin()
+        self._writer.join(timeout=5)
+        if not self._writer.is_alive():  # 쓰기가 아직 막혀 있으면 닫기도 막히므로 건너뜀(데몬 스레드)
+            ctx.close_stdin()
         proc.wait()
         timer.cancel()
         t_err.join(timeout=5)
@@ -251,6 +270,7 @@ class BaseRunner:
         result.context = self.context
         if timed_out.is_set() and not self._cancelled:
             result.ok = False
+            result.timed_out = True
             result.error = f"제한 시간({self.settings.call_timeout_sec}초) 초과로 중단했습니다"
         elif proc.returncode != 0 and not result.error:
             result.ok = False
@@ -259,8 +279,77 @@ class BaseRunner:
 
     keeps_stdin_open = False
 
+    def _write_input(self, proc: subprocess.Popen, ctx: "LineContext", text: str) -> None:
+        """지시문은 출력 읽기와 동시에 별도 스레드에서 쓴다(10/2: 다 쓴 뒤에 출력을 읽었더니, 시작 출력이 큰 새 세션에
+        긴 지시문을 보내면 CLI 는 출력 통로가, 앱은 입력 통로가 차서 서로 멈췄음 — 검토 Clara 가 시작부터 멈춤).
+        승인 응답(ctx.send)은 CLI 가 지시문을 다 읽은 뒤에만 오므로 이 쓰기와 겹치지 않는다."""
+        try:
+            proc.stdin.write(text)
+            proc.stdin.flush()
+        except (OSError, ValueError):  # 시간 초과·중지로 CLI 가 먼저 끝남
+            return
+        if not self.keeps_stdin_open:
+            ctx.close_stdin()  # codex exec 는 stdin 이 열려 있으면 추가 입력을 기다림(실측)
+
     def poll_progress(self, proc: subprocess.Popen, ctx: "LineContext") -> None:
         """실행 중 주기적으로 진행 상황을 읽는 곳(codex 는 세션 파일). 기본은 아무것도 안 함."""
+
+
+class CallTimer:
+    """제한 시간 감시. 실행 허락을 기다리는 동안은 시간을 세지 않는다
+    (10/2: 허락 카드가 처리되지 않은 채 60분이 지나 작업이 끊겼음 → 사장님 지시로 대기 중 정지)."""
+
+    def __init__(self, limit_sec: float, on_timeout: Callable[[], None], tick: float = 1.0):
+        self.limit = limit_sec
+        self.on_timeout = on_timeout
+        self.tick = tick
+        self.used = 0.0              # 지금까지 센 시간(허락 대기 제외)
+        self._waiting = 0            # 동시에 기다리는 허락 수
+        self._last = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        self._last = time.monotonic()
+        threading.Thread(target=self._watch, daemon=True).start()
+
+    def _advance(self) -> None:
+        now = time.monotonic()
+        if not self._waiting:
+            self.used += now - self._last
+        self._last = now
+
+    def _watch(self) -> None:
+        while not self._stop.wait(self.tick):
+            with self._lock:
+                self._advance()
+                over = self.used >= self.limit
+            if over:
+                self._stop.set()
+                self.on_timeout()
+
+    def pause(self) -> None:
+        with self._lock:
+            self._advance()
+            self._waiting += 1
+
+    def resume(self) -> None:
+        with self._lock:
+            self._advance()
+            self._waiting = max(0, self._waiting - 1)
+
+    def paused(self, fn: Callable) -> Callable:
+        """fn(허락 묻기)이 끝날 때까지 시간을 멈추는 감싼 함수."""
+        def wrapped(*a, **kw):
+            self.pause()
+            try:
+                return fn(*a, **kw)
+            finally:
+                self.resume()
+        return wrapped
+
+    def cancel(self) -> None:
+        self._stop.set()
 
 
 class LineContext:
@@ -294,6 +383,17 @@ class LineContext:
                     pass
 
 
+def claude_session_exists(session_id: str | None) -> bool:
+    """claude CLI 가 이 세션 기록(~/.claude/projects/<폴더>/<id>.jsonl)을 이미 만들었는지."""
+    if not session_id:
+        return False
+    root = os.path.join(os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude"), "projects")
+    try:
+        return any(os.path.isfile(os.path.join(root, d, session_id + ".jsonl")) for d in os.listdir(root))
+    except OSError:
+        return False
+
+
 class ClaudeRunner(BaseRunner):
     keeps_stdin_open = True  # 승인 응답을 stdin 으로 보내야 해서 result 가 올 때까지 열어 둠
 
@@ -302,6 +402,8 @@ class ClaudeRunner(BaseRunner):
         if not self.session_id:
             self.session_id = str(uuid.uuid4())
         self._rate_info = None
+        if not self.started and claude_session_exists(self.session_id):
+            self.started = True  # 첫 답 도중 끊긴 세션(10/1: 시간 초과 뒤 --session-id 중복으로 "다시해"가 계속 실패)
         cmd = [s.claude_exe, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
         cmd += ["--resume", self.session_id] if self.started else ["--session-id", self.session_id]
         if a.model:
@@ -320,6 +422,10 @@ class ClaudeRunner(BaseRunner):
             # MCP 조회(DART·법령·verifier)도 묻지 않게(9/28 실측: Clara 는 MCP 호출마다 승인 요청이 왔음)
             cmd += ["--tools", CLAUDE_READONLY_TOOLS, "--allowedTools", *CLAUDE_READONLY_ALLOWED,
                     *[f"mcp__{m}" for m in (s.readonly_mcp_allow or [])]]
+            if a.permission_mode == "auto":
+                # 10/5 사장님 지시: 감독도 실무자처럼 auto 모드(python 외 명령은 분류기가 판단, 삭제·이동·push 는 승인 카드).
+                # 도구 목록(--tools)은 그대로라 Edit 는 여전히 없음
+                cmd += ["--permission-mode", WORKER_PERMISSION_MODE, "--settings", WORKER_SETTINGS]
         else:
             cmd += ["--permission-mode", WORKER_PERMISSION_MODE, "--settings", WORKER_SETTINGS,
                     "--allowedTools", *CLAUDE_WRITE_TOOLS]
@@ -347,6 +453,7 @@ class ClaudeRunner(BaseRunner):
             if ev.get("slash_commands"):
                 ctx.meta({"slash_commands": ev.get("slash_commands")})
         elif t == "assistant":
+            self.started = True  # 답을 쓰기 시작했으면 CLI 쪽 세션 파일이 생김 → 중간에 끊겨도 다음엔 --resume
             msg = ev.get("message") or {}
             u = msg.get("usage") or {}
             if msg.get("id") and u:
@@ -400,6 +507,8 @@ class ClaudeRunner(BaseRunner):
 
 
 class CodexRunner(BaseRunner):
+    fresh_retry_on_resume_failure = True  # 10/8: 로그인 계정이 바뀌면 옛 세션 이어받기가 안 될 수 있음(월요일 개인 계정 전환 대비)
+
     def _exe(self) -> str:
         return find_codex_exe() if self.settings.codex_exe == "auto" else self.settings.codex_exe
 
