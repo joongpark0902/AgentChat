@@ -3,7 +3,7 @@ r"""공개 저장소 검증: GitHub 에서 새로 내려받은 사본으로, 전
 - 그림·그 밖의 바이너리: 고유 내용(blob)마다 크기·종류·메타데이터(EXIF·PNG 글 조각·JPEG 주석)를 적고, 그림은 눈 확인용으로 꺼내 둔다
 - 올리면 안 되는 경로(개인 설정·로그·첨부·실제 인물 사진 등)가 이력 어디에라도 있었는지
 - 커밋 작성자·커미터 이메일과 커밋 메시지
-사용: python tools/verify_public_repo.py <출력 폴더>   (출력 폴더 안에 clone\ 과 blobs\ 가 생긴다. 출력 폴더는 git 제외 위치로)
+사용: python tools/verify_public_repo.py <출력 폴더> [기대 커밋]   (출력 폴더 안에 clone\ 과 blobs\ 가 생긴다. 출력 폴더는 git 제외 위치로)
 결과: 출력 폴더\report.json + 화면 요약. 확인하지 못한 바이너리는 '미확인'으로 따로 센다(0건 집계에 넣지 않음)."""
 from __future__ import annotations
 
@@ -55,12 +55,16 @@ def image_meta(data: bytes) -> dict:
     return {"format": im.format, "size": im.size, "exif": exif, "info": info}
 
 
-def main(out: Path):
+def main(out: Path, expect: str = ""):
     out.mkdir(parents=True, exist_ok=True)
     clone = out / "clone"
     if not clone.exists():
         subprocess.run(["git", "clone", "--quiet", "--mirror", URL, str(clone)], check=True)
+    else:  # 예전 사본을 그대로 쓰지 않게 GitHub 에서 다시 받아 맞춘다
+        subprocess.run(["git", "-C", str(clone), "remote", "update", "--prune"], check=True, capture_output=True)
     head = git(clone, "rev-parse", "main").strip()
+    if expect and not head.startswith(expect):
+        raise SystemExit(f"GitHub main 이 {head[:7]} 입니다(기대 {expect}) — 푸시가 반영됐는지 확인하세요")
     commits = git(clone, "rev-list", "--all").split()
     meta = [l.split("\x1f") for l in git(clone, "log", "--all", "--format=%h\x1f%ae\x1f%ce\x1f%B\x1e").split("\x1e") if l.strip()]
     rep = {"head": head, "commits": len(commits), "emails": sorted({m[i].strip() for m in meta for i in (1, 2)}),
@@ -125,4 +129,4 @@ def main(out: Path):
 
 
 if __name__ == "__main__":
-    main(Path(sys.argv[1]))
+    main(Path(sys.argv[1]), sys.argv[2] if len(sys.argv) > 2 else "")

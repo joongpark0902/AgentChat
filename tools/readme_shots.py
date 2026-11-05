@@ -52,16 +52,36 @@ def make_files(ws: Path) -> None:
     ws.mkdir(parents=True, exist_ok=True)
     rows = [("1월", 1200, 300), ("2월", 1350, 280), ("3월", 1500, 410), ("4월", 1420, 390), ("5월", 1610, 450), ("6월", 1700, 470)]
     (ws / "샘플_매출.csv").write_text("월,온라인,오프라인\n" + "\n".join(f"{m},{a},{b}" for m, a, b in rows), encoding="utf-8")
-    for v in ("v1", "v2"):
+    # 사진 속 이야기와 같게: v1 은 합계 수식이 B2:B6(6월 빠짐) → 8,910천원, v2 는 B2:B7 → 11,080천원. 검증 셀 E8 은 같은 범위로 TRUE
+    for v, end in (("v1", 6), ("v2", 7)):
         wb = Workbook()
         sh = wb.active
         sh.title = "월별 집계"
-        sh.append(["월", "온라인(천원)", "오프라인(천원)", "합계(천원)"])
+        sh.append(["월", "온라인(천원)", "오프라인(천원)", "합계(천원)", "검증"])
         for i, (m, a, b) in enumerate(rows, 2):
-            sh.append([m, a, b, a + b])
-        last = 7 if v == "v2" else 6
-        sh.append(["합계", sum(r[1] for r in rows[:last]), sum(r[2] for r in rows[:last]), sum(r[1] + r[2] for r in rows[:last])])
+            sh.append([m, a, b, f"=B{i}+C{i}"])
+        sh.append(["합계", f"=SUM(B2:B{end})", f"=SUM(C2:C{end})", f"=SUM(D2:D{end})", f"=D8=B8+C8"])
         wb.save(ws / f"매출집계_{v}.xlsx")
+    recalc([ws / "매출집계_v1.xlsx", ws / "매출집계_v2.xlsx"])
+
+
+def recalc(files) -> None:
+    """수식 결과값을 파일에 남긴다(따로 띄운 Excel 로 다시 계산·저장 — 사장님이 열어 둔 Excel 과 섞이지 않게 DispatchEx)."""
+    try:
+        import win32com.client
+    except ImportError:
+        print("  (pywin32 없음 — 수식 결과값 없이 저장)")
+        return
+    xl = win32com.client.DispatchEx("Excel.Application")
+    xl.Visible, xl.DisplayAlerts = False, False
+    try:
+        for f in files:
+            wb = xl.Workbooks.Open(str(f))
+            xl.CalculateFull()
+            wb.Save()
+            wb.Close(False)
+    finally:
+        xl.Quit()
 
 
 SCRIPTS = {
@@ -117,8 +137,10 @@ def main(out: Path) -> None:
 
     try:
         ws = DEMO / "월별매출"
-        make_files(ws)
+        ws.mkdir(parents=True, exist_ok=True)
         conv = L.api("/api/conversations", {"title": "월별 매출 집계표", "workspace": str(ws)})["id"]
+        time.sleep(1.1)
+        make_files(ws)   # 대화를 연 뒤에 만들어야 파일 패널의 '산출물'(이 대화에서 생긴 파일)에 세 파일이 모두 잡힌다
         with sync_playwright() as p:
             browser = p.chromium.launch(channel="chrome", headless=True)
             page = browser.new_page(viewport={"width": 1536, "height": 640})
